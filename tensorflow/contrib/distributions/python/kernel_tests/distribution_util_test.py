@@ -18,11 +18,13 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import math
 import numpy as np
 from scipy import special
 import tensorflow as tf
 
 from tensorflow.contrib.distributions.python.ops import distribution_util
+from tensorflow.python.framework import tensor_util
 
 
 class AssertCloseTest(tf.test.TestCase):
@@ -259,6 +261,89 @@ class LogCombinationsTest(tf.test.TestCase):
       self.assertEqual([2, 2], log_binom.get_shape())
 
 
+class DynamicShapeTest(tf.test.TestCase):
+
+  def testSameDynamicShape(self):
+    with self.test_session():
+      scalar = tf.constant(2.0)
+      scalar1 = tf.placeholder(dtype=tf.float32)
+
+      vector = [0.3, 0.4, 0.5]
+      vector1 = tf.placeholder(dtype=tf.float32, shape=[None])
+      vector2 = tf.placeholder(dtype=tf.float32, shape=[None])
+
+      multidimensional = [[0.3, 0.4], [0.2, 0.6]]
+      multidimensional1 = tf.placeholder(dtype=tf.float32, shape=[None, None])
+      multidimensional2 = tf.placeholder(dtype=tf.float32, shape=[None, None])
+
+      # Scalar
+      self.assertTrue(distribution_util.same_dynamic_shape(
+          scalar, scalar1).eval({
+              scalar1: 2.0}))
+
+      # Vector
+
+      self.assertTrue(distribution_util.same_dynamic_shape(
+          vector, vector1).eval({
+              vector1: [2.0, 3.0, 4.0]}))
+      self.assertTrue(distribution_util.same_dynamic_shape(
+          vector1, vector2).eval({
+              vector1: [2.0, 3.0, 4.0],
+              vector2: [2.0, 3.5, 6.0]}))
+
+      # Multidimensional
+      self.assertTrue(distribution_util.same_dynamic_shape(
+          multidimensional, multidimensional1).eval({
+              multidimensional1: [[2.0, 3.0], [3.0, 4.0]]}))
+      self.assertTrue(distribution_util.same_dynamic_shape(
+          multidimensional1, multidimensional2).eval({
+              multidimensional1: [[2.0, 3.0], [3.0, 4.0]],
+              multidimensional2: [[1.0, 3.5], [6.3, 2.3]]}))
+
+
+      # Scalar, X
+      self.assertFalse(distribution_util.same_dynamic_shape(
+          scalar, vector1).eval({
+              vector1: [2.0, 3.0, 4.0]}))
+      self.assertFalse(distribution_util.same_dynamic_shape(
+          scalar1, vector1).eval({
+              scalar1: 2.0,
+              vector1: [2.0, 3.0, 4.0]}))
+      self.assertFalse(distribution_util.same_dynamic_shape(
+          scalar, multidimensional1).eval({
+              multidimensional1: [[2.0, 3.0], [3.0, 4.0]]}))
+      self.assertFalse(distribution_util.same_dynamic_shape(
+          scalar1, multidimensional1).eval({
+              scalar1: 2.0,
+              multidimensional1: [[2.0, 3.0], [3.0, 4.0]]}))
+
+      # Vector, X
+      self.assertFalse(distribution_util.same_dynamic_shape(
+          vector, vector1).eval({
+              vector1: [2.0, 3.0]}))
+      self.assertFalse(distribution_util.same_dynamic_shape(
+          vector1, vector2).eval({
+              vector1: [2.0, 3.0, 4.0],
+              vector2: [6.0]}))
+      self.assertFalse(distribution_util.same_dynamic_shape(
+          vector, multidimensional1).eval({
+              multidimensional1: [[2.0, 3.0], [3.0, 4.0]]}))
+      self.assertFalse(distribution_util.same_dynamic_shape(
+          vector1, multidimensional1).eval({
+              vector1: [2.0, 3.0, 4.0],
+              multidimensional1: [[2.0, 3.0], [3.0, 4.0]]}))
+
+      # Multidimensional, X
+      self.assertFalse(distribution_util.same_dynamic_shape(
+          multidimensional, multidimensional1).eval({
+              multidimensional1: [[1.0, 3.5, 5.0], [6.3, 2.3, 7.1]]}))
+      self.assertFalse(distribution_util.same_dynamic_shape(
+          multidimensional1, multidimensional2).eval({
+              multidimensional1: [[2.0, 3.0], [3.0, 4.0]],
+              multidimensional2: [[1.0, 3.5, 5.0], [6.3, 2.3, 7.1]]}))
+
+
+
 class RotateTransposeTest(tf.test.TestCase):
 
   def _np_rotate_transpose(self, x, shift):
@@ -315,44 +400,56 @@ class PickVectorTest(tf.test.TestCase):
 
 class FillLowerTriangularTest(tf.test.TestCase):
 
+  def setUp(self):
+    self._rng = np.random.RandomState(42)
+
+  def _fill_lower_triangular(self, x):
+    """Numpy implementation of `fill_lower_triangular`."""
+    x = np.asarray(x)
+    d = x.shape[-1]
+    # d = n(n+1)/2 implies n is:
+    n = int(0.5 * (math.sqrt(1. + 8. * d) - 1.))
+    ids = np.tril_indices(n)
+    y = np.zeros(list(x.shape[:-1]) + [n, n], dtype=x.dtype)
+    y[..., ids[0], ids[1]] = x
+    return y
+
   def testCorrectlyMakes1x1LowerTril(self):
     with self.test_session():
-      x = np.array([[1.], [2], [3]])
-      expected = np.array([[[1.]], [[2]], [[3]]])
-      actual = distribution_util.fill_lower_triangular(x)
+      x = tf.convert_to_tensor(self._rng.randn(3, 1))
+      expected = self._fill_lower_triangular(tensor_util.constant_value(x))
+      actual = distribution_util.fill_lower_triangular(x, validate_args=True)
       self.assertAllEqual(expected.shape, actual.get_shape())
       self.assertAllEqual(expected, actual.eval())
 
   def testCorrectlyMakesNoBatchLowerTril(self):
     with self.test_session():
-      x = np.arange(9)
-      expected = np.array(
-          [[0., 0., 0.],
-           [1., 2., 0.],
-           [3., 4., 5.]])
-      actual = distribution_util.fill_lower_triangular(x)
+      x = tf.convert_to_tensor(self._rng.randn(10))
+      expected = self._fill_lower_triangular(tensor_util.constant_value(x))
+      actual = distribution_util.fill_lower_triangular(x, validate_args=True)
       self.assertAllEqual(expected.shape, actual.get_shape())
       self.assertAllEqual(expected, actual.eval())
+      g = tf.gradients(distribution_util.fill_lower_triangular(x), x)
+      self.assertAllEqual(np.tri(4).reshape(-1), g[0].values.eval())
 
   def testCorrectlyMakesBatchLowerTril(self):
     with self.test_session():
-      x = np.reshape(np.arange(24), (2, 2, 6))
-      expected = np.array(
-          [[[[0., 0., 0.],
-             [1., 2., 0.],
-             [3., 4., 5.]],
-            [[6., 0., 0.],
-             [7., 8., 0.],
-             [9., 10., 11.]]],
-           [[[12., 0., 0.],
-             [13., 14., 0.],
-             [15., 16., 17.]],
-            [[18., 0., 0.],
-             [19., 20., 0.],
-             [21., 22., 23.]]]])
-      actual = distribution_util.fill_lower_triangular(x)
+      x = tf.convert_to_tensor(self._rng.randn(2, 2, 6))
+      expected = self._fill_lower_triangular(tensor_util.constant_value(x))
+      actual = distribution_util.fill_lower_triangular(x, validate_args=True)
       self.assertAllEqual(expected.shape, actual.get_shape())
       self.assertAllEqual(expected, actual.eval())
+      self.assertAllEqual(
+          np.ones((2, 2, 6)),
+          tf.gradients(distribution_util.fill_lower_triangular(
+              x), x)[0].eval())
+
+
+class GenNewSeedTest(tf.test.TestCase):
+
+  def testOnlyNoneReturnsNone(self):
+    self.assertFalse(distribution_util.gen_new_seed(0, "salt") is None)
+    self.assertTrue(distribution_util.gen_new_seed(None, "salt") is None)
 
 
 if __name__ == "__main__":
