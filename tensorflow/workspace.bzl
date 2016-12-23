@@ -17,22 +17,22 @@ def tf_workspace(path_prefix = "", tf_repo_name = ""):
   native.new_http_archive(
       name = "eigen_archive",
       urls = [
-          "http://bazel-mirror.storage.googleapis.com/bitbucket.org/eigen/eigen/get/b28c9f04a3de.tar.gz",
-          "https://bitbucket.org/eigen/eigen/get/b28c9f04a3de.tar.gz",
+          "http://bazel-mirror.storage.googleapis.com/bitbucket.org/eigen/eigen/get/60578b474802.tar.gz",
+          "https://bitbucket.org/eigen/eigen/get/60578b474802.tar.gz",
       ],
-      sha256 = "0a7ce20a0586e6f8157f5ccf8d7a065de2619b1097e58555681c27346c7bebaf",
-      strip_prefix = "eigen-eigen-b28c9f04a3de",
+      sha256 = "7527cda827aff351981ebd910012e16be4d899c28a9ae7f143ae60e7f3f7b83d",
+      strip_prefix = "eigen-eigen-60578b474802",
       build_file = str(Label("//:eigen.BUILD")),
   )
 
   native.new_http_archive(
       name = "libxsmm_archive",
       urls = [
-          "http://bazel-mirror.storage.googleapis.com/github.com/hfp/libxsmm/archive/1.5.tar.gz",
-          "https://github.com/hfp/libxsmm/archive/1.5.tar.gz",
+          "http://bazel-mirror.storage.googleapis.com/github.com/hfp/libxsmm/archive/1.6.1.tar.gz",
+          "https://github.com/hfp/libxsmm/archive/1.6.1.tar.gz",
       ],
-      sha256 = "c52568c5e0e8dc9d8fcf869a716d73598e52f71c3d83af5a4c0b3be81403b423",
-      strip_prefix = "libxsmm-1.5",
+      sha256 = "1dd81077b186300122dc8a8f1872c21fd2bd9b88286ab9f068cc7b62fa7593a7",
+      strip_prefix = "libxsmm-1.6.1",
       build_file = str(Label("//:libxsmm.BUILD")),
   )
 

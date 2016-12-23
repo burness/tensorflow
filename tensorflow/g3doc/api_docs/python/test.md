@@ -492,7 +492,7 @@ then compares them using self._AssertProtoEqual().
 
 - - -
 
-#### `tf.test.TestCase.assertProtoEqualsVersion(expected, actual, producer=19, min_consumer=0)` {#TestCase.assertProtoEqualsVersion}
+#### `tf.test.TestCase.assertProtoEqualsVersion(expected, actual, producer=20, min_consumer=0)` {#TestCase.assertProtoEqualsVersion}
 
 
 
@@ -974,6 +974,13 @@ Returns whether TensorFlow can access a GPU.
 ##### Returns:
 
   True iff a gpu device of the requested kind is available.
+
+
+- - -
+
+### `tf.test.gpu_device_name()` {#gpu_device_name}
+
+Returns the name of a GPU device if available or the empty string.
 
 
 
