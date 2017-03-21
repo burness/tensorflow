@@ -138,6 +138,8 @@ class BundleWriter {
  private:
   Env* const env_;  // Not owned.
   const string prefix_;
+  const string tmp_metadata_path_;
+  const string tmp_data_path_;
   std::unique_ptr<FileOutputBuffer> out_;
   int64 size_;  // Number of bytes written into out_.
   std::map<string, BundleEntryProto> entries_;
@@ -204,6 +206,12 @@ class BundleReader {
   // Validates the stored crc32c checksum against the restored bytes.
   // REQUIRES: status().ok()
   Status Lookup(StringPiece key, Tensor* val) TF_MUST_USE_RESULT;
+
+  // Looks up the slices of the tensor keyed by "key".  On OK, "slices"
+  // is non-empty if and only if the tensor is a partitioned tensor.
+  // REQUIRES: status().ok()
+  Status LookupTensorSlices(StringPiece key, std::vector<TensorSlice>* slices)
+      TF_MUST_USE_RESULT;
 
   // Looks up a specific slice of a partitioned tensor.
   // It is only required that the stored slices cover the requested slice,
@@ -295,8 +303,8 @@ class FileOutputBuffer {
   Status Close();
 
  private:
-  // Appends the buffered data and flushes.
-  Status Flush();
+  // Appends the buffered data to the underlying file. Does NOT flush the file.
+  Status FlushBuffer();
 
   WritableFile* file_;  // Owned.
 

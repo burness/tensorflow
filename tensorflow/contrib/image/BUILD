@@ -49,6 +49,7 @@ py_library(
         ":image_ops",
         "//tensorflow/contrib/util:util_py",
         "//tensorflow/python:array_ops",
+        "//tensorflow/python:constant_op",
         "//tensorflow/python:framework",
         "//tensorflow/python:framework_for_generated_wrappers",
         "//tensorflow/python:math_ops",
@@ -61,9 +62,12 @@ cuda_py_test(
     size = "medium",
     srcs = ["python/kernel_tests/image_ops_test.py"],
     additional_deps = [
-        "//tensorflow:tensorflow_py",
-        "//tensorflow/contrib:contrib_py",
+        ":image_py",
+        "//third_party/py/numpy",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework_for_generated_wrappers",
         "//tensorflow/python:framework_test_lib",
+        "//tensorflow/python:math_ops",
         "//tensorflow/python:platform_test",
     ],
 )

@@ -13,39 +13,46 @@
 # limitations under the License.
 # ==============================================================================
 """Tests for image_ops."""
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
 import numpy as np
-import tensorflow as tf
 
+from tensorflow.contrib.image.python.ops import image_ops
+from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import test_util
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import math_ops
 from tensorflow.python.platform import googletest
 
-_DTYPES = set([tf.uint8, tf.int32, tf.int64, tf.float32, tf.float64])
+_DTYPES = set(
+    [dtypes.uint8, dtypes.int32, dtypes.int64, dtypes.float32, dtypes.float64])
 
 
-class ImageOpsTestCpu(test_util.TensorFlowTestCase):
-  _use_gpu = False
+class ImageOpsTest(test_util.TensorFlowTestCase):
 
   def test_zeros(self):
-    with self.test_session(use_gpu=self._use_gpu):
+    with self.test_session():
       for dtype in _DTYPES:
         for shape in [(5, 5), (24, 24), (2, 24, 24, 3)]:
           for angle in [0, 1, np.pi / 2.0]:
-            image = tf.zeros(shape, dtype)
+            image = array_ops.zeros(shape, dtype)
             self.assertAllEqual(
-                tf.contrib.image.rotate(image, angle).eval(),
+                image_ops.rotate(image, angle).eval(),
                 np.zeros(shape, dtype.as_numpy_dtype()))
 
   def test_rotate_even(self):
-    with self.test_session(use_gpu=self._use_gpu):
+    with self.test_session():
       for dtype in _DTYPES:
-        image = tf.reshape(tf.cast(tf.range(36), dtype), (6, 6))
-        image_rep = tf.tile(image[None, :, :, None], [3, 1, 1, 1])
-        angles = tf.constant([0.0, np.pi / 4.0, np.pi / 2.0], tf.float32)
-        image_rotated = tf.contrib.image.rotate(image_rep, angles)
+        image = array_ops.reshape(
+            math_ops.cast(math_ops.range(36), dtype), (6, 6))
+        image_rep = array_ops.tile(image[None, :, :, None], [3, 1, 1, 1])
+        angles = constant_op.constant([0.0, np.pi / 4.0, np.pi / 2.0],
+                                      dtypes.float32)
+        image_rotated = image_ops.rotate(image_rep, angles)
         self.assertAllEqual(image_rotated[:, :, :, 0].eval(),
                             [[[0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11],
                               [12, 13, 14, 15, 16, 17],
@@ -60,12 +67,14 @@ class ImageOpsTestCpu(test_util.TensorFlowTestCase):
                               [1, 7, 13, 19, 25, 31], [0, 6, 12, 18, 24, 30]]])
 
   def test_rotate_odd(self):
-    with self.test_session(use_gpu=self._use_gpu):
+    with self.test_session():
       for dtype in _DTYPES:
-        image = tf.reshape(tf.cast(tf.range(25), dtype), (5, 5))
-        image_rep = tf.tile(image[None, :, :, None], [3, 1, 1, 1])
-        angles = tf.constant([np.pi / 4.0, 1.0, -np.pi / 2.0], tf.float32)
-        image_rotated = tf.contrib.image.rotate(image_rep, angles)
+        image = array_ops.reshape(
+            math_ops.cast(math_ops.range(25), dtype), (5, 5))
+        image_rep = array_ops.tile(image[None, :, :, None], [3, 1, 1, 1])
+        angles = constant_op.constant([np.pi / 4.0, 1.0, -np.pi / 2.0],
+                                      dtypes.float32)
+        image_rotated = image_ops.rotate(image_rep, angles)
         self.assertAllEqual(image_rotated[:, :, :, 0].eval(),
                             [[[0, 3, 8, 9, 0], [1, 7, 8, 13, 19],
                               [6, 6, 12, 18, 18], [5, 11, 16, 17, 23],
@@ -77,9 +86,29 @@ class ImageOpsTestCpu(test_util.TensorFlowTestCase):
                               [22, 17, 12, 7, 2], [23, 18, 13, 8, 3],
                               [24, 19, 14, 9, 4]]])
 
-
-class ImageOpsTestGpu(ImageOpsTestCpu):
-  _use_gpu = True
+  def test_compose(self):
+    with self.test_session():
+      for dtype in _DTYPES:
+        image = constant_op.constant(
+            [[1, 1, 1, 0],
+             [1, 0, 0, 0],
+             [1, 1, 1, 0],
+             [0, 0, 0, 0]], dtype=dtype)
+        # Rotate counter-clockwise by pi / 2.
+        rotation = image_ops.angles_to_projective_transforms(np.pi / 2, 4, 4)
+        # Translate right by 1 (the transformation matrix is always inverted,
+        # hence the -1).
+        translation = constant_op.constant([1, 0, -1,
+                                            0, 1, 0,
+                                            0, 0],
+                                           dtype=dtypes.float32)
+        composed = image_ops.compose_transforms(rotation, translation)
+        image_transformed = image_ops.transform(image, composed)
+        self.assertAllEqual(image_transformed.eval(),
+                            [[0, 0, 0, 0],
+                             [0, 1, 0, 1],
+                             [0, 1, 0, 1],
+                             [0, 1, 1, 1]])
 
 
 if __name__ == "__main__":

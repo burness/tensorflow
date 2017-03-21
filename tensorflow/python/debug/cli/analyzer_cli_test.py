@@ -17,6 +17,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import inspect
+import os
 import shutil
 import tempfile
 
@@ -25,10 +27,11 @@ from six.moves import xrange  # pylint: disable=redefined-builtin
 
 from tensorflow.core.protobuf import config_pb2
 from tensorflow.python.client import session
-from tensorflow.python.debug import debug_data
-from tensorflow.python.debug import debug_utils
 from tensorflow.python.debug.cli import analyzer_cli
+from tensorflow.python.debug.cli import command_parser
 from tensorflow.python.debug.cli import debugger_cli_common
+from tensorflow.python.debug.lib import debug_data
+from tensorflow.python.debug.lib import debug_utils
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import control_flow_ops
@@ -36,6 +39,10 @@ from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import variables
 from tensorflow.python.platform import googletest
 from tensorflow.python.platform import test
+
+
+def line_number_above():
+  return inspect.stack()[1][2] - 1
 
 
 def parse_op_and_node(line):
@@ -62,24 +69,48 @@ def parse_op_and_node(line):
   return op_type, node_name
 
 
+def assert_column_header_command_shortcut(tst,
+                                          command,
+                                          reverse,
+                                          node_name_regex,
+                                          op_type_regex,
+                                          tensor_filter_name):
+  tst.assertFalse(reverse and "-r" in command)
+  tst.assertFalse(not(op_type_regex) and ("-t %s" % op_type_regex) in command)
+  tst.assertFalse(
+      not(node_name_regex) and ("-t %s" % node_name_regex) in command)
+  tst.assertFalse(
+      not(tensor_filter_name) and ("-t %s" % tensor_filter_name) in command)
+
+
 def assert_listed_tensors(tst,
                           out,
                           expected_tensor_names,
+                          expected_op_types,
                           node_name_regex=None,
                           op_type_regex=None,
-                          tensor_filter_name=None):
+                          tensor_filter_name=None,
+                          sort_by="timestamp",
+                          reverse=False):
   """Check RichTextLines output for list_tensors commands.
 
   Args:
     tst: A test_util.TensorFlowTestCase instance.
     out: The RichTextLines object to be checked.
-    expected_tensor_names: Expected tensor names in the list.
+    expected_tensor_names: (list of str) Expected tensor names in the list.
+    expected_op_types: (list of str) Expected op types of the tensors, in the
+      same order as the expected_tensor_names.
     node_name_regex: Optional: node name regex filter.
     op_type_regex: Optional: op type regex filter.
     tensor_filter_name: Optional: name of the tensor filter.
+    sort_by: (str) (timestamp | op_type | tensor_name) the field by which the
+      tensors in the list are sorted.
+    reverse: (bool) whether the sorting is in reverse (i.e., descending) order.
   """
 
   line_iter = iter(out.lines)
+  attr_segs = out.font_attr_segs
+  line_counter = 0
 
   num_tensors = len(expected_tensor_names)
 
@@ -88,34 +119,118 @@ def assert_listed_tensors(tst,
   else:
     tst.assertEqual("%d dumped tensor(s) passing filter \"%s\":" %
                     (num_tensors, tensor_filter_name), next(line_iter))
+  line_counter += 1
 
   if op_type_regex is not None:
     tst.assertEqual("Op type regex filter: \"%s\"" % op_type_regex,
                     next(line_iter))
+    line_counter += 1
 
   if node_name_regex is not None:
     tst.assertEqual("Node name regex filter: \"%s\"" % node_name_regex,
                     next(line_iter))
+    line_counter += 1
 
   tst.assertEqual("", next(line_iter))
+  line_counter += 1
+
+  # Verify the column heads "t (ms)", "Op type" and "Tensor name" are present.
+  line = next(line_iter)
+  tst.assertIn("t (ms)", line)
+  tst.assertIn("Op type", line)
+  tst.assertIn("Tensor name", line)
+
+  # Verify the command shortcuts in the top row.
+  attr_segs = out.font_attr_segs[line_counter]
+  attr_seg = attr_segs[0]
+  tst.assertEqual(0, attr_seg[0])
+  tst.assertEqual(len("t (ms)"), attr_seg[1])
+  command = attr_seg[2][0].content
+  tst.assertIn("-s timestamp", command)
+  assert_column_header_command_shortcut(
+      tst, command, reverse, node_name_regex, op_type_regex,
+      tensor_filter_name)
+  tst.assertEqual("bold", attr_seg[2][1])
+
+  idx0 = line.index("Size")
+  attr_seg = attr_segs[1]
+  tst.assertEqual(idx0, attr_seg[0])
+  tst.assertEqual(idx0 + len("Size"), attr_seg[1])
+  command = attr_seg[2][0].content
+  tst.assertIn("-s dump_size", command)
+  assert_column_header_command_shortcut(tst, command, reverse, node_name_regex,
+                                        op_type_regex, tensor_filter_name)
+  tst.assertEqual("bold", attr_seg[2][1])
+
+  idx0 = line.index("Op type")
+  attr_seg = attr_segs[2]
+  tst.assertEqual(idx0, attr_seg[0])
+  tst.assertEqual(idx0 + len("Op type"), attr_seg[1])
+  command = attr_seg[2][0].content
+  tst.assertIn("-s op_type", command)
+  assert_column_header_command_shortcut(
+      tst, command, reverse, node_name_regex, op_type_regex,
+      tensor_filter_name)
+  tst.assertEqual("bold", attr_seg[2][1])
+
+  idx0 = line.index("Tensor name")
+  attr_seg = attr_segs[3]
+  tst.assertEqual(idx0, attr_seg[0])
+  tst.assertEqual(idx0 + len("Tensor name"), attr_seg[1])
+  command = attr_seg[2][0].content
+  tst.assertIn("-s tensor_name", command)
+  assert_column_header_command_shortcut(
+      tst, command, reverse, node_name_regex, op_type_regex,
+      tensor_filter_name)
+  tst.assertEqual("bold", attr_seg[2][1])
 
   # Verify the listed tensors and their timestamps.
   tensor_timestamps = []
+  dump_sizes_bytes = []
+  op_types = []
   tensor_names = []
   for line in line_iter:
-    rel_time = float(line.split("ms] ")[0].replace("[", ""))
+    items = line.split(" ")
+    items = [item for item in items if item]
+
+    rel_time = float(items[0][1:-1])
     tst.assertGreaterEqual(rel_time, 0.0)
 
     tensor_timestamps.append(rel_time)
-    tensor_names.append(line.split("ms] ")[1])
+    dump_sizes_bytes.append(command_parser.parse_readable_size_str(items[1]))
+    op_types.append(items[2])
+    tensor_names.append(items[3])
 
   # Verify that the tensors should be listed in ascending order of their
   # timestamps.
-  tst.assertEqual(sorted(tensor_timestamps), tensor_timestamps)
+  if sort_by == "timestamp":
+    sorted_timestamps = sorted(tensor_timestamps)
+    if reverse:
+      sorted_timestamps.reverse()
+    tst.assertEqual(sorted_timestamps, tensor_timestamps)
+  elif sort_by == "dump_size":
+    sorted_dump_sizes_bytes = sorted(dump_sizes_bytes)
+    if reverse:
+      sorted_dump_sizes_bytes.reverse()
+    tst.assertEqual(sorted_dump_sizes_bytes, dump_sizes_bytes)
+  elif sort_by == "op_type":
+    sorted_op_types = sorted(op_types)
+    if reverse:
+      sorted_op_types.reverse()
+    tst.assertEqual(sorted_op_types, op_types)
+  elif sort_by == "tensor_name":
+    sorted_tensor_names = sorted(tensor_names)
+    if reverse:
+      sorted_tensor_names.reverse()
+    tst.assertEqual(sorted_tensor_names, tensor_names)
+  else:
+    tst.fail("Invalid value in sort_by: %s" % sort_by)
 
   # Verify that the tensors are all listed.
-  for tensor_name in expected_tensor_names:
+  for tensor_name, op_type in zip(expected_tensor_names, expected_op_types):
     tst.assertIn(tensor_name, tensor_names)
+    index = tensor_names.index(tensor_name)
+    tst.assertEqual(op_type, op_types[index])
 
 
 def assert_node_attribute_lines(tst,
@@ -128,7 +243,9 @@ def assert_node_attribute_lines(tst,
                                 recipient_op_type_node_name_pairs,
                                 ctrl_recipient_op_type_node_name_pairs,
                                 attr_key_val_pairs=None,
-                                num_dumped_tensors=None):
+                                num_dumped_tensors=None,
+                                show_stack_trace=False,
+                                stack_trace_available=False):
   """Check RichTextLines output for node_info commands.
 
   Args:
@@ -148,6 +265,9 @@ def assert_node_attribute_lines(tst,
     attr_key_val_pairs: Optional: attribute key-value pairs of the node, as a
       list of 2-tuples.
     num_dumped_tensors: Optional: number of tensor dumps from the node.
+    show_stack_trace: (bool) whether the stack trace of the node's
+      construction is asserted to be present.
+    stack_trace_available: (bool) whether Python stack trace is available.
   """
 
   line_iter = iter(out.lines)
@@ -232,10 +352,9 @@ def assert_node_attribute_lines(tst,
     tst.assertItemsEqual(attr_key_val_pairs, kv_pairs)
 
   if num_dumped_tensors is not None:
-    tst.assertEqual("", next(line_iter))
-
     tst.assertEqual("%d dumped tensor(s):" % num_dumped_tensors,
                     next(line_iter))
+    tst.assertEqual("", next(line_iter))
 
     dump_timestamps_ms = []
     for _ in xrange(num_dumped_tensors):
@@ -250,6 +369,34 @@ def assert_node_attribute_lines(tst,
       dump_timestamps_ms.append(dump_timestamp_ms)
 
     tst.assertEqual(sorted(dump_timestamps_ms), dump_timestamps_ms)
+
+  if show_stack_trace:
+    tst.assertEqual("", next(line_iter))
+    tst.assertEqual("", next(line_iter))
+    tst.assertEqual("Traceback of node construction:", next(line_iter))
+    if stack_trace_available:
+      try:
+        depth_counter = 0
+        while True:
+          for i in range(5):
+            line = next(line_iter)
+            if i == 0:
+              tst.assertEqual(depth_counter, int(line.split(":")[0]))
+            elif i == 1:
+              tst.assertStartsWith(line, "  Line:")
+            elif i == 2:
+              tst.assertStartsWith(line, "  Function:")
+            elif i == 3:
+              tst.assertStartsWith(line, "  Text:")
+            elif i == 4:
+              tst.assertEqual("", line)
+
+          depth_counter += 1
+      except StopIteration:
+        tst.assertEqual(0, i)
+    else:
+      tst.assertEqual("(Unavailable because no Python graph has been loaded)",
+                      next(line_iter))
 
 
 def check_syntax_error_output(tst, out, command_prefix):
@@ -324,6 +471,23 @@ def check_main_menu(tst,
   tst.assertTrue(menu.caption_to_item("help").is_enabled())
 
 
+def check_menu_item(tst, out, line_index, expected_begin, expected_end,
+                    expected_command):
+  attr_segs = out.font_attr_segs[line_index]
+  found_menu_item = False
+  for begin, end, attribute in attr_segs:
+    attributes = [attribute] if not isinstance(attribute, list) else attribute
+    menu_item = [attribute for attribute in attributes if
+                 isinstance(attribute, debugger_cli_common.MenuItem)]
+    if menu_item:
+      tst.assertEqual(expected_begin, begin)
+      tst.assertEqual(expected_end, end)
+      tst.assertEqual(expected_command, menu_item[0].content)
+      found_menu_item = True
+      break
+  tst.assertTrue(found_menu_item)
+
+
 class AnalyzerCLISimpleMulAddTest(test_util.TensorFlowTestCase):
 
   @classmethod
@@ -336,21 +500,30 @@ class AnalyzerCLISimpleMulAddTest(test_util.TensorFlowTestCase):
     else:
       cls._main_device = "/job:localhost/replica:0/task:0/cpu:0"
 
-    with session.Session() as sess:
+    cls._curr_file_path = os.path.abspath(
+        inspect.getfile(inspect.currentframe()))
+
+    cls._sess = session.Session()
+    with cls._sess as sess:
       u_init_val = np.array([[5.0, 3.0], [-1.0, 0.0]])
       v_init_val = np.array([[2.0], [-1.0]])
 
       u_name = "simple_mul_add/u"
       v_name = "simple_mul_add/v"
 
-      u_init = constant_op.constant(u_init_val, shape=[2, 2])
+      u_init = constant_op.constant(u_init_val, shape=[2, 2], name="u_init")
       u = variables.Variable(u_init, name=u_name)
-      v_init = constant_op.constant(v_init_val, shape=[2, 1])
+      cls._u_line_number = line_number_above()
+
+      v_init = constant_op.constant(v_init_val, shape=[2, 1], name="v_init")
       v = variables.Variable(v_init, name=v_name)
+      cls._v_line_number = line_number_above()
 
       w = math_ops.matmul(u, v, name="simple_mul_add/matmul")
+      cls._w_line_number = line_number_above()
 
       x = math_ops.add(w, w, name="simple_mul_add/add")
+      cls._x_line_number = line_number_above()
 
       u.initializer.run()
       v.initializer.run()
@@ -391,6 +564,11 @@ class AnalyzerCLISimpleMulAddTest(test_util.TensorFlowTestCase):
         cls._analyzer.print_tensor,
         cls._analyzer.get_help("print_tensor"),
         prefix_aliases=["pt"])
+    cls._registry.register_command_handler(
+        "print_source",
+        cls._analyzer.print_source,
+        cls._analyzer.get_help("print_source"),
+        prefix_aliases=["ps"])
 
   @classmethod
   def tearDownClass(cls):
@@ -405,9 +583,116 @@ class AnalyzerCLISimpleMulAddTest(test_util.TensorFlowTestCase):
         "simple_mul_add/u:0", "simple_mul_add/v:0", "simple_mul_add/u/read:0",
         "simple_mul_add/v/read:0", "simple_mul_add/matmul:0",
         "simple_mul_add/add:0"
-    ])
+    ], ["VariableV2", "VariableV2", "Identity", "Identity", "MatMul", "Add"])
 
     # Check the main menu.
+    check_main_menu(self, out, list_tensors_enabled=False)
+
+  def testListTensorsInReverseTimeOrderWorks(self):
+    # Use shorthand alias for the command prefix.
+    out = self._registry.dispatch_command("lt", ["-s", "timestamp", "-r"])
+    assert_listed_tensors(
+        self,
+        out, [
+            "simple_mul_add/u:0", "simple_mul_add/v:0",
+            "simple_mul_add/u/read:0", "simple_mul_add/v/read:0",
+            "simple_mul_add/matmul:0", "simple_mul_add/add:0"
+        ],
+        ["VariableV2", "VariableV2", "Identity", "Identity", "MatMul", "Add"],
+        sort_by="timestamp",
+        reverse=True)
+    check_main_menu(self, out, list_tensors_enabled=False)
+
+  def testListTensorsInDumpSizeOrderWorks(self):
+    out = self._registry.dispatch_command("lt", ["-s", "dump_size"])
+    assert_listed_tensors(
+        self,
+        out, [
+            "simple_mul_add/u:0", "simple_mul_add/v:0",
+            "simple_mul_add/u/read:0", "simple_mul_add/v/read:0",
+            "simple_mul_add/matmul:0", "simple_mul_add/add:0"
+        ],
+        ["VariableV2", "VariableV2", "Identity", "Identity", "MatMul", "Add"],
+        sort_by="dump_size")
+    check_main_menu(self, out, list_tensors_enabled=False)
+
+  def testListTensorsInReverseDumpSizeOrderWorks(self):
+    out = self._registry.dispatch_command("lt", ["-s", "dump_size", "-r"])
+    assert_listed_tensors(
+        self,
+        out, [
+            "simple_mul_add/u:0", "simple_mul_add/v:0",
+            "simple_mul_add/u/read:0", "simple_mul_add/v/read:0",
+            "simple_mul_add/matmul:0", "simple_mul_add/add:0"
+        ],
+        ["VariableV2", "VariableV2", "Identity", "Identity", "MatMul", "Add"],
+        sort_by="dump_size",
+        reverse=True)
+    check_main_menu(self, out, list_tensors_enabled=False)
+
+  def testListTensorsWithInvalidSortByFieldGivesError(self):
+    out = self._registry.dispatch_command("lt", ["-s", "foobar"])
+    self.assertIn("ValueError: Unsupported key to sort tensors by: foobar",
+                  out.lines)
+
+  def testListTensorsInOpTypeOrderWorks(self):
+    # Use shorthand alias for the command prefix.
+    out = self._registry.dispatch_command("lt", ["-s", "op_type"])
+    assert_listed_tensors(
+        self,
+        out, [
+            "simple_mul_add/u:0", "simple_mul_add/v:0",
+            "simple_mul_add/u/read:0", "simple_mul_add/v/read:0",
+            "simple_mul_add/matmul:0", "simple_mul_add/add:0"
+        ],
+        ["VariableV2", "VariableV2", "Identity", "Identity", "MatMul", "Add"],
+        sort_by="op_type",
+        reverse=False)
+    check_main_menu(self, out, list_tensors_enabled=False)
+
+  def testListTensorsInReverseOpTypeOrderWorks(self):
+    # Use shorthand alias for the command prefix.
+    out = self._registry.dispatch_command("lt", ["-s", "op_type", "-r"])
+    assert_listed_tensors(
+        self,
+        out, [
+            "simple_mul_add/u:0", "simple_mul_add/v:0",
+            "simple_mul_add/u/read:0", "simple_mul_add/v/read:0",
+            "simple_mul_add/matmul:0", "simple_mul_add/add:0"
+        ],
+        ["VariableV2", "VariableV2", "Identity", "Identity", "MatMul", "Add"],
+        sort_by="op_type",
+        reverse=True)
+    check_main_menu(self, out, list_tensors_enabled=False)
+
+  def testListTensorsInTensorNameOrderWorks(self):
+    # Use shorthand alias for the command prefix.
+    out = self._registry.dispatch_command("lt", ["-s", "tensor_name"])
+    assert_listed_tensors(
+        self,
+        out, [
+            "simple_mul_add/u:0", "simple_mul_add/v:0",
+            "simple_mul_add/u/read:0", "simple_mul_add/v/read:0",
+            "simple_mul_add/matmul:0", "simple_mul_add/add:0"
+        ],
+        ["VariableV2", "VariableV2", "Identity", "Identity", "MatMul", "Add"],
+        sort_by="tensor_name",
+        reverse=False)
+    check_main_menu(self, out, list_tensors_enabled=False)
+
+  def testListTensorsInReverseTensorNameOrderWorks(self):
+    # Use shorthand alias for the command prefix.
+    out = self._registry.dispatch_command("lt", ["-s", "tensor_name", "-r"])
+    assert_listed_tensors(
+        self,
+        out, [
+            "simple_mul_add/u:0", "simple_mul_add/v:0",
+            "simple_mul_add/u/read:0", "simple_mul_add/v/read:0",
+            "simple_mul_add/matmul:0", "simple_mul_add/add:0"
+        ],
+        ["VariableV2", "VariableV2", "Identity", "Identity", "MatMul", "Add"],
+        sort_by="tensor_name",
+        reverse=True)
     check_main_menu(self, out, list_tensors_enabled=False)
 
   def testListTensorsFilterByNodeNameRegex(self):
@@ -415,13 +700,12 @@ class AnalyzerCLISimpleMulAddTest(test_util.TensorFlowTestCase):
                                           ["--node_name_filter", ".*read.*"])
     assert_listed_tensors(
         self,
-        out, [
-            "simple_mul_add/u/read:0", "simple_mul_add/v/read:0"
-        ],
+        out, ["simple_mul_add/u/read:0", "simple_mul_add/v/read:0"],
+        ["Identity", "Identity"],
         node_name_regex=".*read.*")
 
     out = self._registry.dispatch_command("list_tensors", ["-n", "^read"])
-    assert_listed_tensors(self, out, [], node_name_regex="^read")
+    assert_listed_tensors(self, out, [], [], node_name_regex="^read")
     check_main_menu(self, out, list_tensors_enabled=False)
 
   def testListTensorFilterByOpTypeRegex(self):
@@ -429,18 +713,16 @@ class AnalyzerCLISimpleMulAddTest(test_util.TensorFlowTestCase):
                                           ["--op_type_filter", "Identity"])
     assert_listed_tensors(
         self,
-        out, [
-            "simple_mul_add/u/read:0", "simple_mul_add/v/read:0"
-        ],
+        out, ["simple_mul_add/u/read:0", "simple_mul_add/v/read:0"],
+        ["Identity", "Identity"],
         op_type_regex="Identity")
 
     out = self._registry.dispatch_command("list_tensors",
                                           ["-t", "(Add|MatMul)"])
     assert_listed_tensors(
         self,
-        out, [
-            "simple_mul_add/add:0", "simple_mul_add/matmul:0"
-        ],
+        out, ["simple_mul_add/add:0", "simple_mul_add/matmul:0"],
+        ["Add", "MatMul"],
         op_type_regex="(Add|MatMul)")
     check_main_menu(self, out, list_tensors_enabled=False)
 
@@ -449,9 +731,7 @@ class AnalyzerCLISimpleMulAddTest(test_util.TensorFlowTestCase):
         "list_tensors", ["-t", "(Add|MatMul)", "-n", ".*add$"])
     assert_listed_tensors(
         self,
-        out, [
-            "simple_mul_add/add:0"
-        ],
+        out, ["simple_mul_add/add:0"], ["Add"],
         node_name_regex=".*add$",
         op_type_regex="(Add|MatMul)")
     check_main_menu(self, out, list_tensors_enabled=False)
@@ -467,7 +747,8 @@ class AnalyzerCLISimpleMulAddTest(test_util.TensorFlowTestCase):
     out = self._registry.dispatch_command("lt", ["-f", "has_inf_or_nan"])
 
     # This TF graph run did not generate any bad numerical values.
-    assert_listed_tensors(self, out, [], tensor_filter_name="has_inf_or_nan")
+    assert_listed_tensors(
+        self, out, [], [], tensor_filter_name="has_inf_or_nan")
     # TODO(cais): A test with some actual bad numerical values.
 
     check_main_menu(self, out, list_tensors_enabled=False)
@@ -503,6 +784,11 @@ class AnalyzerCLISimpleMulAddTest(test_util.TensorFlowTestCase):
         list_inputs_node_name=node_name,
         print_tensor_node_name=node_name,
         list_outputs_node_name=node_name)
+
+    # Verify that the node name is bold in the first line.
+    self.assertEqual(
+        [(len(out.lines[0]) - len(node_name), len(out.lines[0]), "bold")],
+        out.font_attr_segs[0])
 
   def testNodeInfoShowAttributes(self):
     node_name = "simple_mul_add/matmul"
@@ -540,6 +826,55 @@ class AnalyzerCLISimpleMulAddTest(test_util.TensorFlowTestCase):
                             ("Identity", "simple_mul_add/v/read")], [],
         [("Add", "simple_mul_add/add"), ("Add", "simple_mul_add/add")], [],
         num_dumped_tensors=1)
+    check_main_menu(
+        self,
+        out,
+        list_tensors_enabled=True,
+        list_inputs_node_name=node_name,
+        print_tensor_node_name=node_name,
+        list_outputs_node_name=node_name)
+    check_menu_item(self, out, 16,
+                    len(out.lines[16]) - len(out.lines[16].strip()),
+                    len(out.lines[16]), "pt %s:0 -n 0" % node_name)
+
+  def testNodeInfoShowStackTraceUnavailableIsIndicated(self):
+    self._debug_dump.set_python_graph(None)
+
+    node_name = "simple_mul_add/matmul"
+    out = self._registry.dispatch_command("node_info", ["-t", node_name])
+
+    assert_node_attribute_lines(
+        self,
+        out,
+        node_name,
+        "MatMul",
+        self._main_device, [("Identity", "simple_mul_add/u/read"),
+                            ("Identity", "simple_mul_add/v/read")], [],
+        [("Add", "simple_mul_add/add"), ("Add", "simple_mul_add/add")], [],
+        show_stack_trace=True, stack_trace_available=False)
+    check_main_menu(
+        self,
+        out,
+        list_tensors_enabled=True,
+        list_inputs_node_name=node_name,
+        print_tensor_node_name=node_name,
+        list_outputs_node_name=node_name)
+
+  def testNodeInfoShowStackTraceAvailableWorks(self):
+    self._debug_dump.set_python_graph(self._sess.graph)
+
+    node_name = "simple_mul_add/matmul"
+    out = self._registry.dispatch_command("node_info", ["-t", node_name])
+
+    assert_node_attribute_lines(
+        self,
+        out,
+        node_name,
+        "MatMul",
+        self._main_device, [("Identity", "simple_mul_add/u/read"),
+                            ("Identity", "simple_mul_add/v/read")], [],
+        [("Add", "simple_mul_add/add"), ("Add", "simple_mul_add/add")], [],
+        show_stack_trace=True, stack_trace_available=True)
     check_main_menu(
         self,
         out,
@@ -800,6 +1135,142 @@ class AnalyzerCLISimpleMulAddTest(test_util.TensorFlowTestCase):
                                  "There is no tensor filter named \"bar\""):
       analyzer.get_tensor_filter("bar")
 
+  def _findSourceLine(self, annotated_source, line_number):
+    """Find line of given line number in annotated source.
+
+    Args:
+      annotated_source: (debugger_cli_common.RichTextLines) the annotated source
+      line_number: (int) 1-based line number
+
+    Returns:
+      (int) If line_number is found, 0-based line index in
+        annotated_source.lines. Otherwise, None.
+    """
+
+    index = None
+    for i, line in enumerate(annotated_source.lines):
+      if line.startswith("L%d " % line_number):
+        index = i
+        break
+    return index
+
+  def testPrintSourceForOpNamesWholeFileWorks(self):
+    self._debug_dump.set_python_graph(self._sess.graph)
+    out = self._registry.dispatch_command(
+        "print_source", [self._curr_file_path], screen_info={"cols": 80})
+
+    # Verify the annotation of the line that creates u.
+    index = self._findSourceLine(out, self._u_line_number)
+    self.assertEqual(
+        ["L%d         u = variables.Variable(u_init, name=u_name)" %
+         self._u_line_number,
+         "    simple_mul_add/u",
+         "    simple_mul_add/u/Assign",
+         "    simple_mul_add/u/read"],
+        out.lines[index : index + 4])
+    self.assertEqual("pt simple_mul_add/u",
+                     out.font_attr_segs[index + 1][0][2].content)
+    # simple_mul_add/u/Assign is not used in this run because the Variable has
+    # already been initialized.
+    self.assertEqual("blue", out.font_attr_segs[index + 2][0][2])
+    self.assertEqual("pt simple_mul_add/u/read",
+                     out.font_attr_segs[index + 3][0][2].content)
+
+    # Verify the annotation of the line that creates v.
+    index = self._findSourceLine(out, self._v_line_number)
+    self.assertEqual(
+        ["L%d         v = variables.Variable(v_init, name=v_name)" %
+         self._v_line_number,
+         "    simple_mul_add/v"],
+        out.lines[index : index + 2])
+    self.assertEqual("pt simple_mul_add/v",
+                     out.font_attr_segs[index + 1][0][2].content)
+
+    # Verify the annotation of the line that creates w.
+    index = self._findSourceLine(out, self._w_line_number)
+    self.assertEqual(
+        ["L%d         " % self._w_line_number +
+         "w = math_ops.matmul(u, v, name=\"simple_mul_add/matmul\")",
+         "    simple_mul_add/matmul"],
+        out.lines[index : index + 2])
+    self.assertEqual("pt simple_mul_add/matmul",
+                     out.font_attr_segs[index + 1][0][2].content)
+
+    # Verify the annotation of the line that creates x.
+    index = self._findSourceLine(out, self._x_line_number)
+    self.assertEqual(
+        ["L%d         " % self._x_line_number +
+         "x = math_ops.add(w, w, name=\"simple_mul_add/add\")",
+         "    simple_mul_add/add"],
+        out.lines[index : index + 2])
+    self.assertEqual("pt simple_mul_add/add",
+                     out.font_attr_segs[index + 1][0][2].content)
+
+  def testPrintSourceForTensorNamesWholeFileWorks(self):
+    self._debug_dump.set_python_graph(self._sess.graph)
+    out = self._registry.dispatch_command(
+        "print_source",
+        [self._curr_file_path, "--tensors"],
+        screen_info={"cols": 80})
+
+    # Verify the annotation of the line that creates u.
+    index = self._findSourceLine(out, self._u_line_number)
+    self.assertEqual(
+        ["L%d         u = variables.Variable(u_init, name=u_name)" %
+         self._u_line_number,
+         "    simple_mul_add/u/read:0",
+         "    simple_mul_add/u:0"],
+        out.lines[index : index + 3])
+    self.assertEqual("pt simple_mul_add/u/read:0",
+                     out.font_attr_segs[index + 1][0][2].content)
+    self.assertEqual("pt simple_mul_add/u:0",
+                     out.font_attr_segs[index + 2][0][2].content)
+
+  def testPrintSourceForOpNamesStartingAtSpecifiedLineWorks(self):
+    self._debug_dump.set_python_graph(self._sess.graph)
+    out = self._registry.dispatch_command(
+        "print_source",
+        [self._curr_file_path, "-b", "3"],
+        screen_info={"cols": 80})
+
+    self.assertIn("Omitted 2 source lines", out.lines[0])
+    self.assertIsNone(self._findSourceLine(out, 1))
+    self.assertIsNone(self._findSourceLine(out, 2))
+    self.assertIsNotNone(self._findSourceLine(out, 3))
+
+    index = self._findSourceLine(out, self._u_line_number)
+    self.assertEqual(
+        ["L%d         u = variables.Variable(u_init, name=u_name)" %
+         self._u_line_number,
+         "    simple_mul_add/u",
+         "    simple_mul_add/u/Assign",
+         "    simple_mul_add/u/read"],
+        out.lines[index : index + 4])
+    self.assertEqual("pt simple_mul_add/u",
+                     out.font_attr_segs[index + 1][0][2].content)
+    # simple_mul_add/u/Assign is not used in this run because the Variable has
+    # already been initialized.
+    self.assertEqual("blue", out.font_attr_segs[index + 2][0][2])
+    self.assertEqual("pt simple_mul_add/u/read",
+                     out.font_attr_segs[index + 3][0][2].content)
+
+  def testPrintSourceForOpNameSettingMaximumElementCountWorks(self):
+    self._debug_dump.set_python_graph(self._sess.graph)
+    out = self._registry.dispatch_command(
+        "print_source",
+        [self._curr_file_path, "-m", "1"],
+        screen_info={"cols": 80})
+
+    index = self._findSourceLine(out, self._u_line_number)
+    self.assertEqual(
+        ["L%d         u = variables.Variable(u_init, name=u_name)" %
+         self._u_line_number,
+         "    simple_mul_add/u",
+         "    (... Omitted 2 of 3 op(s) ...)"],
+        out.lines[index : index + 3])
+    self.assertEqual("pt simple_mul_add/u",
+                     out.font_attr_segs[index + 1][0][2].content)
+
 
 class AnalyzerCLIPrintLargeTensorTest(test_util.TensorFlowTestCase):
 
@@ -962,6 +1433,25 @@ class AnalyzerCLIControlDepTest(test_util.TensorFlowTestCase):
                                 [("Identity", "control_deps/ctrl_dep_y"),
                                  ("Identity", "control_deps/ctrl_dep_z")])
 
+    # Verify the menu items (command shortcuts) in the output.
+    check_menu_item(self, out, 10,
+                    len(out.lines[10]) - len("control_deps/x/read"),
+                    len(out.lines[10]), "ni -a -d -t control_deps/x/read")
+    if out.lines[13].endswith("control_deps/ctrl_dep_y"):
+      y_line = 13
+      z_line = 14
+    else:
+      y_line = 14
+      z_line = 13
+    check_menu_item(self, out, y_line,
+                    len(out.lines[y_line]) - len("control_deps/ctrl_dep_y"),
+                    len(out.lines[y_line]),
+                    "ni -a -d -t control_deps/ctrl_dep_y")
+    check_menu_item(self, out, z_line,
+                    len(out.lines[z_line]) - len("control_deps/ctrl_dep_z"),
+                    len(out.lines[z_line]),
+                    "ni -a -d -t control_deps/ctrl_dep_z")
+
   def testListInputsNonRecursiveNoControl(self):
     """List inputs non-recursively, without any control inputs."""
 
@@ -993,6 +1483,17 @@ class AnalyzerCLIControlDepTest(test_util.TensorFlowTestCase):
         print_tensor_node_name=node_name,
         list_outputs_node_name=node_name)
 
+    # Verify that the node name has bold attribute.
+    self.assertEqual([(16, 16 + len(node_name), "bold")], out.font_attr_segs[0])
+
+    # Verify the menu items (command shortcuts) in the output.
+    check_menu_item(self, out, 1,
+                    len(out.lines[1]) - len("control_deps/x/read"),
+                    len(out.lines[1]), "li -c -r control_deps/x/read")
+    check_menu_item(self, out, 3,
+                    len(out.lines[3]) - len("control_deps/ctrl_dep_y"),
+                    len(out.lines[3]), "li -c -r control_deps/ctrl_dep_y")
+
   def testListInputsNonRecursiveNoControlUsingTensorName(self):
     """List inputs using the name of an output tensor of the node."""
 
@@ -1014,6 +1515,12 @@ class AnalyzerCLIControlDepTest(test_util.TensorFlowTestCase):
         node_info_node_name=node_name,
         print_tensor_node_name=node_name,
         list_outputs_node_name=node_name)
+    check_menu_item(self, out, 1,
+                    len(out.lines[1]) - len("control_deps/x/read"),
+                    len(out.lines[1]), "li -c -r control_deps/x/read")
+    check_menu_item(self, out, 3,
+                    len(out.lines[3]) - len("control_deps/ctrl_dep_y"),
+                    len(out.lines[3]), "li -c -r control_deps/ctrl_dep_y")
 
   def testListInputsNonRecursiveWithControls(self):
     """List inputs non-recursively, with control inputs."""
@@ -1035,6 +1542,15 @@ class AnalyzerCLIControlDepTest(test_util.TensorFlowTestCase):
         node_info_node_name=node_name,
         print_tensor_node_name=node_name,
         list_outputs_node_name=node_name)
+    check_menu_item(self, out, 1,
+                    len(out.lines[1]) - len("control_deps/z"),
+                    len(out.lines[1]), "li -c -r control_deps/z")
+    check_menu_item(self, out, 3,
+                    len(out.lines[3]) - len("control_deps/ctrl_dep_y"),
+                    len(out.lines[3]), "li -c -r control_deps/ctrl_dep_y")
+    check_menu_item(self, out, 5,
+                    len(out.lines[5]) - len("control_deps/x"),
+                    len(out.lines[5]), "li -c -r control_deps/x")
 
   def testListInputsRecursiveWithControls(self):
     """List inputs recursively, with control inputs."""
@@ -1071,6 +1587,15 @@ class AnalyzerCLIControlDepTest(test_util.TensorFlowTestCase):
         node_info_node_name=node_name,
         print_tensor_node_name=node_name,
         list_outputs_node_name=node_name)
+    check_menu_item(self, out, 1,
+                    len(out.lines[1]) - len("control_deps/z"),
+                    len(out.lines[1]), "li -c -r control_deps/z")
+    check_menu_item(self, out, 11,
+                    len(out.lines[11]) - len("control_deps/ctrl_dep_y"),
+                    len(out.lines[11]), "li -c -r control_deps/ctrl_dep_y")
+    check_menu_item(self, out, 18,
+                    len(out.lines[18]) - len("control_deps/x"),
+                    len(out.lines[18]), "li -c -r control_deps/x")
 
   def testListInputsRecursiveWithControlsWithDepthLimit(self):
     """List inputs recursively, with control inputs and a depth limit."""
@@ -1097,6 +1622,12 @@ class AnalyzerCLIControlDepTest(test_util.TensorFlowTestCase):
         node_info_node_name=node_name,
         print_tensor_node_name=node_name,
         list_outputs_node_name=node_name)
+    check_menu_item(self, out, 1,
+                    len(out.lines[1]) - len("control_deps/z"),
+                    len(out.lines[1]), "li -c -r control_deps/z")
+    check_menu_item(self, out, 10,
+                    len(out.lines[10]) - len("control_deps/x"),
+                    len(out.lines[10]), "li -c -r control_deps/x")
 
   def testListInputsNodeWithoutInputs(self):
     """List the inputs to a node without any input."""
@@ -1142,6 +1673,19 @@ class AnalyzerCLIControlDepTest(test_util.TensorFlowTestCase):
         "", "Legend:", "  (d): recursion depth = d.",
         "  (Ctrl): Control input.",
         "  [Op]: Input node has op type Op."], out.lines)
+    check_menu_item(self, out, 1,
+                    len(out.lines[1]) - len("control_deps/x/read"),
+                    len(out.lines[1]), "lo -c -r control_deps/x/read")
+    check_menu_item(self, out, 3,
+                    len(out.lines[3]) - len("control_deps/ctrl_dep_y"),
+                    len(out.lines[3]), "lo -c -r control_deps/ctrl_dep_y")
+    check_menu_item(self, out, 5,
+                    len(out.lines[5]) - len("control_deps/ctrl_dep_z"),
+                    len(out.lines[5]), "lo -c -r control_deps/ctrl_dep_z")
+
+    # Verify the bold attribute of the node name.
+    self.assertEqual([(20, 20 + len("control_deps/x"), "bold")],
+                     out.font_attr_segs[0])
 
 
 class AnalyzerCLIWhileLoopTest(test_util.TensorFlowTestCase):
@@ -1206,7 +1750,7 @@ class AnalyzerCLIWhileLoopTest(test_util.TensorFlowTestCase):
           " ms] while/Identity:0:DebugIdentity"))
 
     self.assertEqual(
-        "Use the -n (--number) flag to specify which dump to print.",
+        "You can use the -n (--number) flag to specify which dump to print.",
         output.lines[-3])
     self.assertEqual("For example:", output.lines[-2])
     self.assertEqual("  print_tensor while/Identity:0 -n 0", output.lines[-1])
@@ -1221,7 +1765,8 @@ class AnalyzerCLIWhileLoopTest(test_util.TensorFlowTestCase):
       self.assertEqual("  dtype: int32", output.lines[1])
       self.assertEqual("  shape: ()", output.lines[2])
       self.assertEqual("", output.lines[3])
-      self.assertEqual("array(%d, dtype=int32)" % i, output.lines[4])
+      self.assertTrue(output.lines[4].startswith("array(%d" % i))
+      self.assertTrue(output.lines[4].endswith(")"))
 
   def testMultipleDumpsPrintTensorInvalidNumber(self):
     output = self._registry.dispatch_command("pt",

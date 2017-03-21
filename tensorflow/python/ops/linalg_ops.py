@@ -124,13 +124,13 @@ def eye(num_rows,
       diag_size = num_rows
     else:
       diag_size = math_ops.minimum(num_rows, num_columns)
-    diag_shape = array_ops.concat_v2((batch_shape, [diag_size]), 0)
+    diag_shape = array_ops.concat((batch_shape, [diag_size]), 0)
     diag_ones = array_ops.ones(diag_shape, dtype=dtype)
 
     if num_columns is None:
       return array_ops.matrix_diag(diag_ones)
     else:
-      shape = array_ops.concat_v2((batch_shape, [num_rows, num_columns]), 0)
+      shape = array_ops.concat((batch_shape, [num_rows, num_columns]), 0)
       zero_matrix = array_ops.zeros(shape, dtype=dtype)
       return array_ops.matrix_set_diag(zero_matrix, diag_ones)
 
@@ -264,6 +264,12 @@ def svd(tensor, full_matrices=False, compute_uv=True, name=None):
     v: Left singular vectors. If `full_matrices` is `False` (default) then
       shape is `[..., N, P]`. If `full_matrices` is `True` then shape is
       `[..., N, N]`. Not returned if `compute_uv` is `False`.
+
+  @compatibility(numpy)
+  Mostly equivalent to numpy.linalg.svd, except that the order of output
+  arguments here is `s`, `u`, `v` when `compute_uv` is `True`, as opposed to
+  `u`, `s`, `v` for numpy.linalg.svd.
+  @end_compatibility
   """
   # pylint: disable=protected-access
   s, u, v = gen_linalg_ops._svd(
@@ -279,18 +285,19 @@ def svd(tensor, full_matrices=False, compute_uv=True, name=None):
 def norm(tensor, ord='euclidean', axis=None, keep_dims=False, name=None):
   r"""Computes the norm of vectors, matrices, and tensors.
 
-  This function can compute 3 different matrix norms (Frobenius, 1-norm, and
-  inf-norm) and up to 9218868437227405311 different vectors norms.
+  This function can compute several different vector norms (the 1-norm, the
+  Euclidean or 2-norm, the inf-norm, and in general the p-norm for p > 0) and
+  matrix norms (Frobenius, 1-norm, and inf-norm).
 
   Args:
     tensor: `Tensor` of types `float32`, `float64`, `complex64`, `complex128`
     ord: Order of the norm. Supported values are 'fro', 'euclidean', `0`,
-      `1, `2`, `np.inf` and any positive real number yielding the corresponding
+      `1`, `2`, `np.inf` and any positive real number yielding the corresponding
       p-norm. Default is 'euclidean' which is equivalent to Frobenius norm if
       `tensor` is a matrix and equivalent to 2-norm for vectors.
-      Some restrictions apply,
+      Some restrictions apply:
         a) The Frobenius norm `fro` is not defined for vectors,
-        b) If axis is a 2-tuple (matrix-norm), only 'euclidean', 'fro', `1`,
+        b) If axis is a 2-tuple (matrix norm), only 'euclidean', 'fro', `1`,
            `np.inf` are supported.
       See the description of `axis` on how to compute norms for a batch of
       vectors or matrices stored in a tensor.
@@ -299,7 +306,7 @@ def norm(tensor, ord='euclidean', axis=None, keep_dims=False, name=None):
       tensor, i.e. `norm(tensor, ord=ord)` is equivalent to
       `norm(reshape(tensor, [-1]), ord=ord)`.
       If `axis` is a Python integer, the input is considered a batch of vectors,
-      and `axis`t determines the axis in `tensor` over which to compute vector
+      and `axis` determines the axis in `tensor` over which to compute vector
       norms.
       If `axis` is a 2-tuple of Python integers it is considered a batch of
       matrices and `axis` determines the axes in `tensor` over which to compute
@@ -324,10 +331,10 @@ def norm(tensor, ord='euclidean', axis=None, keep_dims=False, name=None):
     ValueError: If `ord` or `axis` is invalid.
 
   @compatibility(numpy)
-  Mostly equivalent to np.linalg.norm.
+  Mostly equivalent to numpy.linalg.norm.
   Not supported: ord <= 0, 2-norm for matrices, nuclear norm.
   Other differences:
-    a) If axis is `None`, treats the the flattened `tensor` as a vector
+    a) If axis is `None`, treats the flattened `tensor` as a vector
      regardless of rank.
     b) Explicitly supports 'euclidean' norm as the default, including for
      higher order tensors.

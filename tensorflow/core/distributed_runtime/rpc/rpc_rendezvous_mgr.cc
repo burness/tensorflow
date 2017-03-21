@@ -92,7 +92,7 @@ class RpcRecvTensorCall : public BaseRecvTensorCall {
     // RpcRecvTensorCall, and it always sets this->wi_ to null when
     // a call object is released to it, we can assert that this->wi_ is
     // always null at the point of deletion.
-    CHECK_EQ(nullptr, wi_)
+    CHECK_EQ(static_cast<WorkerInterface*>(nullptr), wi_)
         << "Leaking WorkerInterface in RpcRecvTensorCall destructor.";
   }
 
@@ -216,7 +216,7 @@ class WorkerFreeListCache : public WorkerCacheInterface {
     }
   }
 
-  void ListWorkers(std::vector<string>* workers) override {
+  void ListWorkers(std::vector<string>* workers) const override {
     wrapped_->ListWorkers(workers);
   }
 
@@ -229,7 +229,7 @@ class WorkerFreeListCache : public WorkerCacheInterface {
     WorkerState state;
     state.worker = wrapped_->CreateWorker(target);
     if (state.worker != nullptr) {
-      workers_.insert(make_pair(target, state));
+      workers_.insert(std::make_pair(target, state));
     }
     return state.worker;
   }
