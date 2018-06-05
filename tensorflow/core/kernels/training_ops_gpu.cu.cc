@@ -145,6 +145,53 @@ struct ApplyAdam<GPUDevice, T> {
 };
 
 template <typename T>
+struct ApplyAMSGrad<GPUDevice, T> {
+  void operator()(const GPUDevice& d, typename TTypes<T>::Flat var,
+                  typename TTypes<T>::Flat m, typename TTypes<T>::Flat v,
+                  typename TTypes<T>::ConstScalar beta1_power,
+                  typename TTypes<T>::ConstScalar beta2_power,
+                  typename TTypes<T>::ConstScalar lr,
+                  typename TTypes<T>::ConstScalar beta1,
+                  typename TTypes<T>::ConstScalar beta2,
+                  typename TTypes<T>::ConstScalar epsilon,
+                  typename TTypes<T>::ConstFlat grad, bool use_nesterov) {
+    Eigen::array<typename TTypes<T>::Tensor::Index, 1> bcast;
+    bcast[0] = grad.dimension(0);
+    Eigen::Sizes<1> single;
+    const auto one = static_cast<T>(1.0);
+    m.device(d) =
+        m +
+        (beta1.constant(one) - beta1).reshape(single).broadcast(bcast) *
+            (grad - m);
+    Flat v_last_step = v;
+    v.device(d) =
+        v +
+        (beta2.constant(one) - beta2).reshape(single).broadcast(bcast) *
+            (grad.square() - v);
+    v = v.cwiseMax(v_last_step);
+    
+    if (use_nesterov) {
+      var.device(d) -=
+          (lr * (beta2_power.constant(one) - beta2_power).sqrt() /
+           (beta1_power.constant(one) - beta1_power))
+              .reshape(single)
+              .broadcast(bcast) *
+          (m * beta1.reshape(single).broadcast(bcast) +
+           (beta1.constant(one) - beta1).reshape(single).broadcast(bcast) *
+               grad) /
+          (epsilon.reshape(single).broadcast(bcast) + v.sqrt());
+    } else {
+      var.device(d) -= (lr * (beta2_power.constant(one) - beta2_power).sqrt() /
+                        (beta1_power.constant(one) - beta1_power))
+                           .reshape(single)
+                           .broadcast(bcast) *
+                       m /
+                       (epsilon.reshape(single).broadcast(bcast) + v.sqrt());
+    }
+  }
+};
+
+template <typename T>
 struct ApplyRMSProp<GPUDevice, T> {
   void operator()(const GPUDevice& d, typename TTypes<T>::Flat var,
                   typename TTypes<T>::Flat ms, typename TTypes<T>::Flat mom,

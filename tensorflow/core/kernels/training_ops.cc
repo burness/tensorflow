@@ -328,6 +328,60 @@ struct ApplyAdamSYCL {
 template <typename T>
 struct ApplyAdam<CPUDevice, T> : ApplyAdamNonCuda<CPUDevice, T> {};
 
+template <typename Device, typename T>
+struct ApplyAMSGradNonCuda {
+  void operator()(const Device& d, typename TTypes<T>::Flat var,
+                  typename TTypes<T>::Flat m, typename TTypes<T>::Flat v,
+                  typename TTypes<T>::ConstScalar beta1_power,
+                  typename TTypes<T>::ConstScalar beta2_power,
+                  typename TTypes<T>::ConstScalar lr,
+                  typename TTypes<T>::ConstScalar beta1,
+                  typename TTypes<T>::ConstScalar beta2,
+                  typename TTypes<T>::ConstScalar epsilon,
+                  typename TTypes<T>::ConstFlat grad, bool use_nesterov) {
+    const T alpha = lr() * Eigen::numext::sqrt(T(1) - beta2_power()) /
+                    (T(1) - beta1_power());
+    // beta1 == μ
+    // beta2 == ν
+    // v     == n
+    // var   == θ
+    // m += (grad -m) * (1-beta1())
+    m.device(d) += (grad - m) * (T(1) - beta1());
+    typename TTypes<T>::Flat v_last_step = v;
+    v.device(d) += (grad.square() - v) * (T(1) - beta2());
+    // v_t = max(v_t, v_t-1)
+    v = v.cwiseMax(v_last_step);
+
+    if (use_nesterov) {
+      var.device(d) -= ((grad * (T(1) - beta1()) + beta1() * m) * alpha) /
+                       (v.sqrt() + epsilon());
+    } else {
+      var.device(d) -= (m * alpha) / (v.sqrt() + epsilon());
+    }
+  }
+};
+
+#ifdef TENSORFLOW_USE_SYCL
+template <typename T>
+struct ApplyAMSGradSYCL {
+  void operator()(const SYCLDevice& d, typename TTypes<T>::Flat var,
+                  typename TTypes<T>::Flat m, typename TTypes<T>::Flat v,
+                  T beta1_power, T beta2_power, T lr, T beta1, T beta2,
+                  T epsilon, typename TTypes<T>::ConstFlat grad) {
+    const T alpha =
+        lr * Eigen::numext::sqrt(T(1) - beta2_power) / (T(1) - beta1_power);
+    m.device(d) += (grad - m) * (T(1) - beta1);
+    Flat v_last_step = v;
+    v.device(d) += (grad.square() - v) * (T(1) - beta2);
+    v = v.cwiseMax(v_last_step);
+    var.device(d) -= (m * alpha) / (v.sqrt() + epsilon);
+  }
+};
+#endif  // TENSORFLOW_USE_SYCL
+
+template <typename T>
+struct ApplyAMSGrad<CPUDevice, T> : ApplyAMSGradNonCuda<CPUDevice, T> {};
+
 template <typename T>
 struct ApplyRMSProp<CPUDevice, T> {
   void operator()(const CPUDevice& d, typename TTypes<T>::Flat var,
@@ -2737,6 +2791,267 @@ REGISTER_KERNELS(GPU, Eigen::half);
 REGISTER_KERNELS(GPU, float);
 REGISTER_KERNELS(GPU, double);
 #endif
+#undef REGISTER_CPU_KERNELS
+#undef REGISTER_KERNELS
+
+template <typename Device, typename T>
+class ApplyAMSGradOp : public OpKernel {
+ public:
+  explicit ApplyAMSGradOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_nesterov", &use_nesterov_));
+  }
+
+  void Compute(OpKernelContext* ctx) override {
+    auto locks = MaybeLockVariableInputMutexesInOrder(ctx, use_exclusive_lock_,
+                                                      {0, 1, 2});
+
+    Tensor var;
+    OP_REQUIRES_OK(ctx, GetInputTensorFromVariable<Device, T>(
+                            ctx, 0, use_exclusive_lock_, false, &var));
+    Tensor m;
+    OP_REQUIRES_OK(ctx, GetInputTensorFromVariable<Device, T>(
+                            ctx, 1, use_exclusive_lock_, false, &m));
+    Tensor v;
+    OP_REQUIRES_OK(ctx, GetInputTensorFromVariable<Device, T>(
+                            ctx, 2, use_exclusive_lock_, false, &v));
+    OP_REQUIRES(
+        ctx, var.IsInitialized(),
+        errors::FailedPrecondition(
+            "Attempting to use uninitialized variables: ", requested_input(0)));
+    OP_REQUIRES(
+        ctx, m.IsInitialized(),
+        errors::FailedPrecondition(
+            "Attempting to use uninitialized variables: ", requested_input(1)));
+    OP_REQUIRES(
+        ctx, v.IsInitialized(),
+        errors::FailedPrecondition(
+            "Attempting to use uninitialized variables: ", requested_input(2)));
+
+    const Tensor& beta1_power = ctx->input(3);
+    const Tensor& beta2_power = ctx->input(4);
+    const Tensor& lr = ctx->input(5);
+    const Tensor& beta1 = ctx->input(6);
+    const Tensor& beta2 = ctx->input(7);
+    const Tensor& epsilon = ctx->input(8);
+
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta1_power.shape()),
+                errors::InvalidArgument("beta1_power is not a scalar: ",
+                                        beta1_power.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta2_power.shape()),
+                errors::InvalidArgument("beta2_power is not a scalar: ",
+                                        beta2_power.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(lr.shape()),
+                errors::InvalidArgument("lr is not a scalar : ",
+                                        lr.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta1.shape()),
+                errors::InvalidArgument("beta1 is not a scalar: ",
+                                        beta1.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta2.shape()),
+                errors::InvalidArgument("beta2 is not a scalar: ",
+                                        beta2.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(epsilon.shape()),
+                errors::InvalidArgument("epsilon is not a scalar: ",
+                                        epsilon.shape().DebugString()));
+
+    const Tensor& grad = ctx->input(9);
+    OP_REQUIRES(ctx, var.shape().IsSameSize(m.shape()),
+                errors::InvalidArgument("var and m do not have the same shape",
+                                        var.shape().DebugString(), " ",
+                                        m.shape().DebugString()));
+    OP_REQUIRES(ctx, var.shape().IsSameSize(v.shape()),
+                errors::InvalidArgument("var and v do not have the same shape",
+                                        var.shape().DebugString(), " ",
+                                        v.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(grad.shape()),
+        errors::InvalidArgument("var and grad do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                grad.shape().DebugString()));
+
+    const Device& device = ctx->template eigen_device<Device>();
+    functor::ApplyAMSGrad<Device, T>()(
+        device, var.flat<T>(), m.flat<T>(), v.flat<T>(),
+        beta1_power.scalar<T>(), beta2_power.scalar<T>(), lr.scalar<T>(),
+        beta1.scalar<T>(), beta2.scalar<T>(), epsilon.scalar<T>(),
+        grad.flat<T>(), use_nesterov_);
+
+    MaybeForwardRefInputToRefOutput(ctx, 0, 0);
+  }
+
+ private:
+  bool use_exclusive_lock_;
+  bool use_nesterov_;
+};
+
+#ifdef TENSORFLOW_USE_SYCL
+template <typename T>
+class ApplyAMSGradOp<SYCLDevice, T> : public OpKernel {
+ public:
+  explicit ApplyAMSGradOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+  }
+
+  void Compute(OpKernelContext* ctx) override {
+    auto locks = MaybeLockVariableInputMutexesInOrder(ctx, use_exclusive_lock_,
+                                                      {0, 1, 2});
+
+    Tensor var;
+    OP_REQUIRES_OK(ctx, GetInputTensorFromVariable<SYCLDevice, T>(
+                            ctx, 0, use_exclusive_lock_, false, &var));
+    Tensor m;
+    OP_REQUIRES_OK(ctx, GetInputTensorFromVariable<SYCLDevice, T>(
+                            ctx, 1, use_exclusive_lock_, false, &m));
+    Tensor v;
+    OP_REQUIRES_OK(ctx, GetInputTensorFromVariable<SYCLDevice, T>(
+                            ctx, 2, use_exclusive_lock_, false, &v));
+    OP_REQUIRES(
+        ctx, var.IsInitialized(),
+        errors::FailedPrecondition(
+            "Attempting to use uninitialized variables: ", requested_input(0)));
+    OP_REQUIRES(
+        ctx, m.IsInitialized(),
+        errors::FailedPrecondition(
+            "Attempting to use uninitialized variables: ", requested_input(1)));
+    OP_REQUIRES(
+        ctx, v.IsInitialized(),
+        errors::FailedPrecondition(
+            "Attempting to use uninitialized variables: ", requested_input(2)));
+
+    const Tensor& beta1_power_dev = ctx->input(3);
+    const Tensor& beta2_power_dev = ctx->input(4);
+    const Tensor& lr_dev = ctx->input(5);
+    const Tensor& beta1_dev = ctx->input(6);
+    const Tensor& beta2_dev = ctx->input(7);
+    const Tensor& epsilon_dev = ctx->input(8);
+
+    T beta1_power = 0;
+    T beta2_power = 0;
+    T lr = 0;
+    T beta1 = 0;
+    T beta2 = 0;
+    T epsilon = 0;
+
+    auto device = ctx->eigen_sycl_device();
+    auto size = sizeof(T);
+    auto src_ptr = GetBase(&beta1_power_dev);
+    device.memcpyDeviceToHost(&beta1_power, static_cast<const T*>(src_ptr),
+                              size);
+
+    src_ptr = GetBase(&beta2_power_dev);
+    device.memcpyDeviceToHost(&beta2_power, static_cast<const T*>(src_ptr),
+                              size);
+
+    src_ptr = GetBase(&lr_dev);
+    device.memcpyDeviceToHost(&lr, static_cast<const T*>(src_ptr), size);
+
+    src_ptr = GetBase(&beta1_dev);
+    device.memcpyDeviceToHost(&beta1, static_cast<const T*>(src_ptr), size);
+
+    src_ptr = GetBase(&beta2_dev);
+    device.memcpyDeviceToHost(&beta2, static_cast<const T*>(src_ptr), size);
+
+    src_ptr = GetBase(&epsilon_dev);
+    device.memcpyDeviceToHost(&epsilon, static_cast<const T*>(src_ptr), size);
+
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta1_power_dev.shape()),
+                errors::InvalidArgument("beta1_power is not a scalar: ",
+                                        beta1_power_dev.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta2_power_dev.shape()),
+                errors::InvalidArgument("beta2_power is not a scalar: ",
+                                        beta2_power_dev.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(lr_dev.shape()),
+                errors::InvalidArgument("lr is not a scalar : ",
+                                        lr_dev.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta1_dev.shape()),
+                errors::InvalidArgument("beta1 is not a scalar: ",
+                                        beta1_dev.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta2_dev.shape()),
+                errors::InvalidArgument("beta2 is not a scalar: ",
+                                        beta2_dev.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(epsilon_dev.shape()),
+                errors::InvalidArgument("epsilon is not a scalar: ",
+                                        epsilon_dev.shape().DebugString()));
+
+    const Tensor& grad = ctx->input(9);
+
+    OP_REQUIRES(ctx, var.shape().IsSameSize(m.shape()),
+                errors::InvalidArgument("var and m do not have the same shape",
+                                        var.shape().DebugString(), " ",
+                                        m.shape().DebugString()));
+    OP_REQUIRES(ctx, var.shape().IsSameSize(v.shape()),
+                errors::InvalidArgument("var and v do not have the same shape",
+                                        var.shape().DebugString(), " ",
+                                        v.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(grad.shape()),
+        errors::InvalidArgument("var and grad do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                grad.shape().DebugString()));
+
+    functor::ApplyAMSGradSYCL<T>()(device, var.flat<T>(), m.flat<T>(), v.flat<T>(),
+                                beta1_power, beta2_power, lr, beta1, beta2,
+                                epsilon, grad.flat<T>());
+
+    MaybeForwardRefInputToRefOutput(ctx, 0, 0);
+  }
+
+ private:
+  bool use_exclusive_lock_;
+};
+#endif  // TENSORFLOW_USE_SYCL
+
+#define REGISTER_KERNELS(D, T)                                     \
+  REGISTER_KERNEL_BUILDER(                                         \
+      Name("ApplyAMSGrad").Device(DEVICE_##D).TypeConstraint<T>("T"), \
+      ApplyAMSGradOp<D##Device, T>);                                  \
+  REGISTER_KERNEL_BUILDER(Name("ResourceApplyAMSGrad")                \
+                              .HostMemory("var")                   \
+                              .HostMemory("m")                     \
+                              .HostMemory("v")                     \
+                              .Device(DEVICE_##D)                  \
+                              .TypeConstraint<T>("T"),             \
+                          ApplyAMSGradOp<D##Device, T>);
+#define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
+
+TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_float(REGISTER_CPU_KERNELS);
+TF_CALL_double(REGISTER_CPU_KERNELS);
+
+#ifdef TENSORFLOW_USE_SYCL
+#define REGISTER_SYCL_KERNELS(T) REGISTER_KERNELS(SYCL, T);
+
+TF_CALL_float(REGISTER_SYCL_KERNELS);
+TF_CALL_double(REGISTER_SYCL_KERNELS);
+#endif
+
+#if GOOGLE_CUDA
+// Forward declarations of the functor specializations for GPU.
+namespace functor {
+#define DECLARE_GPU_SPEC(T)                                   \
+  template <>                                                 \
+  void ApplyAMSGrad<GPUDevice, T>::operator()(                   \
+      const GPUDevice& d, typename TTypes<T>::Flat var,       \
+      typename TTypes<T>::Flat m, typename TTypes<T>::Flat v, \
+      typename TTypes<T>::ConstScalar beta1_power,            \
+      typename TTypes<T>::ConstScalar beta2_power,            \
+      typename TTypes<T>::ConstScalar lr,                     \
+      typename TTypes<T>::ConstScalar beta1,                  \
+      typename TTypes<T>::ConstScalar beta2,                  \
+      typename TTypes<T>::ConstScalar epsilon,                \
+      typename TTypes<T>::ConstFlat grad, bool use_nesterov); \
+  extern template struct ApplyAMSGrad<GPUDevice, T>;
+DECLARE_GPU_SPEC(Eigen::half);
+DECLARE_GPU_SPEC(float);
+DECLARE_GPU_SPEC(double);
+#undef DECLARE_GPU_SPEC
+}  // namespace functor
+
+REGISTER_KERNELS(GPU, Eigen::half);
+REGISTER_KERNELS(GPU, float);
+REGISTER_KERNELS(GPU, double);
+#endif
+
 #undef REGISTER_CPU_KERNELS
 #undef REGISTER_KERNELS
 
