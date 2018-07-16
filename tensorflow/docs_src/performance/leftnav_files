@@ -1,6 +1,8 @@
+index.md
 performance_guide.md
-performance_models.md
+datasets_performance.md
 benchmarks.md
+quantization.md
 
 ### XLA
 xla/index.md
@@ -10,6 +12,3 @@ xla/jit.md
 xla/operation_semantics.md
 xla/shapes.md
 xla/tfcompile.md
-
-### Quantization
-quantization.md

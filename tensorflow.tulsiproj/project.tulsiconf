@@ -1,0 +1,13 @@
+{
+  "configDefaults" : {
+    "optionSet" : {
+
+    }
+  },
+  "projectName" : "tensorflow",
+  "packages" : [
+    "",
+    "tensorflow"
+  ],
+  "workspaceRoot" : ".."
+}

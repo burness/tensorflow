@@ -15,6 +15,8 @@ limitations under the License.
 
 #define EIGEN_USE_THREADS
 
+#include "tensorflow/core/lib/bfloat16/bfloat16.h"
+
 #include <algorithm>
 
 #include "tensorflow/core/framework/op_kernel.h"
@@ -151,8 +153,10 @@ struct ApplyAdagrad<CPUDevice, T> {
   void operator()(const CPUDevice& d, typename TTypes<T>::Flat var,
                   typename TTypes<T>::Flat accum,
                   typename TTypes<T>::ConstScalar lr,
-                  typename TTypes<T>::ConstFlat grad) {
-    accum.device(d) += grad.square();
+                  typename TTypes<T>::ConstFlat grad, bool update_slots) {
+    if (update_slots) {
+      accum.device(d) += grad.square();
+    }
     var.device(d) -= grad * lr() * accum.rsqrt();
   }
 };
@@ -329,15 +333,23 @@ template <typename T>
 struct ApplyAdam<CPUDevice, T> : ApplyAdamNonCuda<CPUDevice, T> {};
 
 template <typename Device, typename T>
+<<<<<<< HEAD
 struct ApplyAMSGradNonCuda {
   void operator()(const Device& d, typename TTypes<T>::Flat var,
                   typename TTypes<T>::Flat m, typename TTypes<T>::Flat v,
                   typename TTypes<T>::ConstScalar beta1_power,
                   typename TTypes<T>::ConstScalar beta2_power,
+=======
+struct ApplyAdaMaxNonCuda {
+  void operator()(const Device& d, typename TTypes<T>::Flat var,
+                  typename TTypes<T>::Flat m, typename TTypes<T>::Flat v,
+                  typename TTypes<T>::ConstScalar beta1_power,
+>>>>>>> origin/master
                   typename TTypes<T>::ConstScalar lr,
                   typename TTypes<T>::ConstScalar beta1,
                   typename TTypes<T>::ConstScalar beta2,
                   typename TTypes<T>::ConstScalar epsilon,
+<<<<<<< HEAD
                   typename TTypes<T>::ConstFlat grad, bool use_nesterov) {
     const T alpha = lr() * Eigen::numext::sqrt(T(1) - beta2_power()) /
                     (T(1) - beta1_power());
@@ -381,6 +393,19 @@ struct ApplyAMSGradSYCL {
 
 template <typename T>
 struct ApplyAMSGrad<CPUDevice, T> : ApplyAMSGradNonCuda<CPUDevice, T> {};
+=======
+                  typename TTypes<T>::ConstFlat grad) {
+    m.device(d) += (grad - m) * (T(1) - beta1());
+    // Here v is u in section 7.1
+    v.device(d) = (beta2() * v).cwiseMax(grad.abs());
+    // var is θ in section 7.1
+    var.device(d) -= lr() / (T(1) - beta1_power()) * (m / (v + epsilon()));
+  }
+};
+
+template <typename T>
+struct ApplyAdaMax<CPUDevice, T> : ApplyAdaMaxNonCuda<CPUDevice, T> {};
+>>>>>>> origin/master
 
 template <typename T>
 struct ApplyRMSProp<CPUDevice, T> {
@@ -548,6 +573,7 @@ class ApplyGradientDescentOp<SYCLDevice, T> : public OpKernel {
 #define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -701,6 +727,7 @@ class ApplyAdadeltaOp : public OpKernel {
 #define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -876,6 +903,7 @@ class SparseApplyAdadeltaOp : public OpKernel {
   REGISTER_KERNELS(T, int64);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -1102,6 +1130,7 @@ class ApplyAdagradOp : public OpKernel {
  public:
   explicit ApplyAdagradOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("update_slots", &update_slots_));
   }
 
   void Compute(OpKernelContext* ctx) override {
@@ -1139,13 +1168,15 @@ class ApplyAdagradOp : public OpKernel {
 
     const Device& device = ctx->template eigen_device<Device>();
     functor::ApplyAdagrad<Device, T>()(device, var.flat<T>(), accum.flat<T>(),
-                                       lr.scalar<T>(), grad.flat<T>());
+                                       lr.scalar<T>(), grad.flat<T>(),
+                                       update_slots_);
 
     MaybeForwardRefInputToRefOutput(ctx, 0, 0);
   }
 
  private:
   bool use_exclusive_lock_;
+  bool update_slots_;
 };
 
 #define REGISTER_KERNELS(D, T)                                        \
@@ -1161,6 +1192,7 @@ class ApplyAdagradOp : public OpKernel {
 #define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -1172,7 +1204,7 @@ namespace functor {
   void ApplyAdagrad<GPUDevice, T>::operator()(                            \
       const GPUDevice& d, typename TTypes<T>::Flat var,                   \
       typename TTypes<T>::Flat accum, typename TTypes<T>::ConstScalar lr, \
-      typename TTypes<T>::ConstFlat grad);                                \
+      typename TTypes<T>::ConstFlat grad, bool update_slots);             \
   extern template struct ApplyAdagrad<GPUDevice, T>;
 DECLARE_GPU_SPEC(Eigen::half);
 DECLARE_GPU_SPEC(float);
@@ -1282,11 +1314,8 @@ inline T FtrlCompute(const T& accum, const T& linear, const T& lr, const T& l1,
     quadratic =
         Eigen::numext::pow(accum, -lr_power) / lr + static_cast<T>(2) * l2;
   }
-  if (Eigen::numext::abs(linear) > l1) {
-    return (l1 * sgn(linear) - linear) / quadratic;
-  } else {
-    return static_cast<T>(0.0);
-  }
+  auto l1_reg_adjust = std::max(std::min(linear, l1), -l1);
+  return (l1_reg_adjust - linear) / quadratic;
 }
 }  // namespace
 
@@ -1296,6 +1325,7 @@ class SparseApplyAdagradOp : public OpKernel {
  public:
   explicit SparseApplyAdagradOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("update_slots", &update_slots_));
   }
 
   void Compute(OpKernelContext* ctx) override NO_THREAD_SAFETY_ANALYSIS {
@@ -1369,7 +1399,9 @@ class SparseApplyAdagradOp : public OpKernel {
           auto a = accum_flat.template chip<0>(index);
           auto g = grad_flat.template chip<0>(i);
           auto v = var_flat.template chip<0>(index);
-          a += g.square();
+          if (update_slots_) {
+            a += g.square();
+          }
           v -= g.constant(lr_scalar) * g * a.rsqrt();
         }
       } else {
@@ -1388,7 +1420,9 @@ class SparseApplyAdagradOp : public OpKernel {
                                           " in indices is out of range")));
           T& a = accum_flat(index);
           const T& g = grad_flat(i);
-          a += g * g;
+          if (update_slots_) {
+            a += g * g;
+          }
           var_flat(index) -= lr_scalar * g / Eigen::numext::sqrt(a);
         }
       }
@@ -1399,6 +1433,7 @@ class SparseApplyAdagradOp : public OpKernel {
 
  private:
   bool use_exclusive_lock_;
+  bool update_slots_;
 };
 
 #define REGISTER_KERNELS(T, Tindices)                                \
@@ -1417,6 +1452,7 @@ class SparseApplyAdagradOp : public OpKernel {
   REGISTER_KERNELS(T, int64);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -2018,6 +2054,7 @@ class ApplyFtrlOp : public OpKernel {
 #define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -2039,6 +2076,7 @@ TF_CALL_double(REGISTER_CPU_KERNELS);
 #define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -2287,6 +2325,7 @@ class SparseApplyFtrlOp : public OpKernel {
   REGISTER_KERNELS(T, int64);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -2311,6 +2350,7 @@ TF_CALL_double(REGISTER_CPU_KERNELS);
   REGISTER_KERNELS(T, int64);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -2389,6 +2429,7 @@ class ApplyMomentumOp : public OpKernel {
 #define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -2528,6 +2569,7 @@ class SparseApplyMomentumOp : public OpKernel {
   REGISTER_KERNELS(T, int64);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -2755,6 +2797,7 @@ class ApplyAdamOp<SYCLDevice, T> : public OpKernel {
 #define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -2795,11 +2838,18 @@ REGISTER_KERNELS(GPU, double);
 #undef REGISTER_KERNELS
 
 template <typename Device, typename T>
+<<<<<<< HEAD
 class ApplyAMSGradOp : public OpKernel {
  public:
   explicit ApplyAMSGradOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("use_nesterov", &use_nesterov_));
+=======
+class ApplyAdaMaxOp : public OpKernel {
+ public:
+  explicit ApplyAdaMaxOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+>>>>>>> origin/master
   }
 
   void Compute(OpKernelContext* ctx) override {
@@ -2829,18 +2879,28 @@ class ApplyAMSGradOp : public OpKernel {
             "Attempting to use uninitialized variables: ", requested_input(2)));
 
     const Tensor& beta1_power = ctx->input(3);
+<<<<<<< HEAD
     const Tensor& beta2_power = ctx->input(4);
     const Tensor& lr = ctx->input(5);
     const Tensor& beta1 = ctx->input(6);
     const Tensor& beta2 = ctx->input(7);
     const Tensor& epsilon = ctx->input(8);
+=======
+    const Tensor& lr = ctx->input(4);
+    const Tensor& beta1 = ctx->input(5);
+    const Tensor& beta2 = ctx->input(6);
+    const Tensor& epsilon = ctx->input(7);
+>>>>>>> origin/master
 
     OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta1_power.shape()),
                 errors::InvalidArgument("beta1_power is not a scalar: ",
                                         beta1_power.shape().DebugString()));
+<<<<<<< HEAD
     OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta2_power.shape()),
                 errors::InvalidArgument("beta2_power is not a scalar: ",
                                         beta2_power.shape().DebugString()));
+=======
+>>>>>>> origin/master
     OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(lr.shape()),
                 errors::InvalidArgument("lr is not a scalar : ",
                                         lr.shape().DebugString()));
@@ -2854,7 +2914,11 @@ class ApplyAMSGradOp : public OpKernel {
                 errors::InvalidArgument("epsilon is not a scalar: ",
                                         epsilon.shape().DebugString()));
 
+<<<<<<< HEAD
     const Tensor& grad = ctx->input(9);
+=======
+    const Tensor& grad = ctx->input(8);
+>>>>>>> origin/master
     OP_REQUIRES(ctx, var.shape().IsSameSize(m.shape()),
                 errors::InvalidArgument("var and m do not have the same shape",
                                         var.shape().DebugString(), " ",
@@ -2870,17 +2934,26 @@ class ApplyAMSGradOp : public OpKernel {
                                 grad.shape().DebugString()));
 
     const Device& device = ctx->template eigen_device<Device>();
+<<<<<<< HEAD
     functor::ApplyAMSGrad<Device, T>()(
         device, var.flat<T>(), m.flat<T>(), v.flat<T>(),
         beta1_power.scalar<T>(), beta2_power.scalar<T>(), lr.scalar<T>(),
         beta1.scalar<T>(), beta2.scalar<T>(), epsilon.scalar<T>(),
         grad.flat<T>(), use_nesterov_);
+=======
+    functor::ApplyAdaMax<Device, T>()(
+        device, var.flat<T>(), m.flat<T>(), v.flat<T>(),
+        beta1_power.scalar<T>(), lr.scalar<T>(),
+        beta1.scalar<T>(), beta2.scalar<T>(), epsilon.scalar<T>(),
+        grad.flat<T>());
+>>>>>>> origin/master
 
     MaybeForwardRefInputToRefOutput(ctx, 0, 0);
   }
 
  private:
   bool use_exclusive_lock_;
+<<<<<<< HEAD
   bool use_nesterov_;
 };
 
@@ -3006,18 +3079,32 @@ class ApplyAMSGradOp<SYCLDevice, T> : public OpKernel {
       Name("ApplyAMSGrad").Device(DEVICE_##D).TypeConstraint<T>("T"), \
       ApplyAMSGradOp<D##Device, T>);                                  \
   REGISTER_KERNEL_BUILDER(Name("ResourceApplyAMSGrad")                \
+=======
+};
+
+#define REGISTER_KERNELS(D, T)                                     \
+  REGISTER_KERNEL_BUILDER(                                         \
+      Name("ApplyAdaMax").Device(DEVICE_##D).TypeConstraint<T>("T"), \
+      ApplyAdaMaxOp<D##Device, T>);                                  \
+  REGISTER_KERNEL_BUILDER(Name("ResourceApplyAdaMax")                \
+>>>>>>> origin/master
                               .HostMemory("var")                   \
                               .HostMemory("m")                     \
                               .HostMemory("v")                     \
                               .Device(DEVICE_##D)                  \
                               .TypeConstraint<T>("T"),             \
+<<<<<<< HEAD
                           ApplyAMSGradOp<D##Device, T>);
+=======
+                          ApplyAdaMaxOp<D##Device, T>);
+>>>>>>> origin/master
 #define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
+<<<<<<< HEAD
 #ifdef TENSORFLOW_USE_SYCL
 #define REGISTER_SYCL_KERNELS(T) REGISTER_KERNELS(SYCL, T);
 
@@ -3025,22 +3112,36 @@ TF_CALL_float(REGISTER_SYCL_KERNELS);
 TF_CALL_double(REGISTER_SYCL_KERNELS);
 #endif
 
+=======
+>>>>>>> origin/master
 #if GOOGLE_CUDA
 // Forward declarations of the functor specializations for GPU.
 namespace functor {
 #define DECLARE_GPU_SPEC(T)                                   \
   template <>                                                 \
+<<<<<<< HEAD
   void ApplyAMSGrad<GPUDevice, T>::operator()(                   \
       const GPUDevice& d, typename TTypes<T>::Flat var,       \
       typename TTypes<T>::Flat m, typename TTypes<T>::Flat v, \
       typename TTypes<T>::ConstScalar beta1_power,            \
       typename TTypes<T>::ConstScalar beta2_power,            \
+=======
+  void ApplyAdaMax<GPUDevice, T>::operator()(                   \
+      const GPUDevice& d, typename TTypes<T>::Flat var,       \
+      typename TTypes<T>::Flat m, typename TTypes<T>::Flat v, \
+      typename TTypes<T>::ConstScalar beta1_power,            \
+>>>>>>> origin/master
       typename TTypes<T>::ConstScalar lr,                     \
       typename TTypes<T>::ConstScalar beta1,                  \
       typename TTypes<T>::ConstScalar beta2,                  \
       typename TTypes<T>::ConstScalar epsilon,                \
+<<<<<<< HEAD
       typename TTypes<T>::ConstFlat grad, bool use_nesterov); \
   extern template struct ApplyAMSGrad<GPUDevice, T>;
+=======
+      typename TTypes<T>::ConstFlat grad); \
+  extern template struct ApplyAdaMax<GPUDevice, T>;
+>>>>>>> origin/master
 DECLARE_GPU_SPEC(Eigen::half);
 DECLARE_GPU_SPEC(float);
 DECLARE_GPU_SPEC(double);
@@ -3051,7 +3152,10 @@ REGISTER_KERNELS(GPU, Eigen::half);
 REGISTER_KERNELS(GPU, float);
 REGISTER_KERNELS(GPU, double);
 #endif
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/master
 #undef REGISTER_CPU_KERNELS
 #undef REGISTER_KERNELS
 
@@ -3255,6 +3359,7 @@ class ApplyCenteredRMSPropOp : public OpKernel {
 #define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
@@ -3594,7 +3699,6 @@ REGISTER_KERNELS(double, int64);
 
 #undef REGISTER_KERNELS
 
-
 template <typename Device, typename T>
 class ApplyAddSignOp : public OpKernel {
  public:
@@ -3671,23 +3775,22 @@ class ApplyAddSignOp : public OpKernel {
 #define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
 #if GOOGLE_CUDA
 // Forward declarations of the functor specializations for GPU.
 namespace functor {
-#define DECLARE_GPU_SPEC(T)                                               \
-  template <>                                                             \
-  void ApplyAddSign<GPUDevice, T>::operator()(                            \
-      const GPUDevice& d,                                                 \
-      typename TTypes<T>::Flat var,                                       \
-      typename TTypes<T>::Flat m,                                         \
-      typename TTypes<T>::ConstScalar lr,                                 \
-      typename TTypes<T>::ConstScalar alpha,                              \
-      typename TTypes<T>::ConstScalar sign_decay,                         \
-      typename TTypes<T>::ConstScalar beta,                               \
-      typename TTypes<T>::ConstFlat grad);                                \
+#define DECLARE_GPU_SPEC(T)                                           \
+  template <>                                                         \
+  void ApplyAddSign<GPUDevice, T>::operator()(                        \
+      const GPUDevice& d, typename TTypes<T>::Flat var,               \
+      typename TTypes<T>::Flat m, typename TTypes<T>::ConstScalar lr, \
+      typename TTypes<T>::ConstScalar alpha,                          \
+      typename TTypes<T>::ConstScalar sign_decay,                     \
+      typename TTypes<T>::ConstScalar beta,                           \
+      typename TTypes<T>::ConstFlat grad);                            \
   extern template struct ApplyAddSign<GPUDevice, T>;
 DECLARE_GPU_SPEC(Eigen::half);
 DECLARE_GPU_SPEC(float);
@@ -3701,7 +3804,6 @@ REGISTER_KERNELS(GPU, double);
 #endif
 #undef REGISTER_CPU_KERNELS
 #undef REGISTER_KERNELS
-
 
 template <typename Device, typename T>
 class ApplyPowerSignOp : public OpKernel {
@@ -3779,23 +3881,22 @@ class ApplyPowerSignOp : public OpKernel {
 #define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
 
 TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
 #if GOOGLE_CUDA
 // Forward declarations of the functor specializations for GPU.
 namespace functor {
-#define DECLARE_GPU_SPEC(T)                                               \
-  template <>                                                             \
-  void ApplyPowerSign<GPUDevice, T>::operator()(                          \
-      const GPUDevice& d,                                                 \
-      typename TTypes<T>::Flat var,                                       \
-      typename TTypes<T>::Flat m,                                         \
-      typename TTypes<T>::ConstScalar lr,                                 \
-      typename TTypes<T>::ConstScalar logbase,                            \
-      typename TTypes<T>::ConstScalar sign_decay,                         \
-      typename TTypes<T>::ConstScalar beta,                               \
-      typename TTypes<T>::ConstFlat grad);                                \
+#define DECLARE_GPU_SPEC(T)                                           \
+  template <>                                                         \
+  void ApplyPowerSign<GPUDevice, T>::operator()(                      \
+      const GPUDevice& d, typename TTypes<T>::Flat var,               \
+      typename TTypes<T>::Flat m, typename TTypes<T>::ConstScalar lr, \
+      typename TTypes<T>::ConstScalar logbase,                        \
+      typename TTypes<T>::ConstScalar sign_decay,                     \
+      typename TTypes<T>::ConstScalar beta,                           \
+      typename TTypes<T>::ConstFlat grad);                            \
   extern template struct ApplyPowerSign<GPUDevice, T>;
 DECLARE_GPU_SPEC(Eigen::half);
 DECLARE_GPU_SPEC(float);

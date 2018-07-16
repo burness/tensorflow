@@ -1,0 +1,10 @@
+{
+  "optionSet" : {
+    "WorkspaceRootPath" : {
+      "p" : "/Users/burness/git_repository/tensorflow/tensorflow"
+    },
+    "BazelPath" : {
+      "p" : "/usr/local/bin/bazel"
+    }
+  }
+}

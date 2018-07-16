@@ -21,48 +21,13 @@ limitations under the License.
 #include <type_traits>
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+
 #include "tensorflow/core/framework/numeric_types.h"
 #include "tensorflow/core/framework/tensor_types.h"
 #include "tensorflow/core/kernels/bounds_check.h"
 
 namespace Eigen {
-namespace numext {
-#if GOOGLE_CUDA
-template<> EIGEN_DEVICE_FUNC EIGEN_ALWAYS_INLINE
-std::complex<float> exp(const std::complex<float> &x) {
-  auto com = ::expf(x.real());
-  auto res_real = com * ::cosf(x.imag());
-  auto res_imag = com * ::sinf(x.imag());
-  return std::complex<float>(res_real, res_imag);
-}
-template<> EIGEN_DEVICE_FUNC EIGEN_ALWAYS_INLINE
-std::complex<double> exp(const std::complex<double> &x) {
-  auto com = ::exp(x.real());
-  auto res_real = com * ::cos(x.imag());
-  auto res_imag = com * ::sin(x.imag());
-  return std::complex<double>(res_real, res_imag);
-}
-#endif
-}
-
 namespace internal {
-
-// TODO(rmlarsen): Get rid of fmod2 once fmod is upstreamed to Eigen.
-template <typename T>
-struct scalar_fmod2_op {
-  EIGEN_EMPTY_STRUCT_CTOR(scalar_fmod2_op)
-  EIGEN_DEVICE_FUNC EIGEN_STRONG_INLINE const T operator()(const T& a,
-                                                           const T& b) const {
-    return std::fmod(a, b);
-  }
-};
-template <typename T>
-struct functor_traits<scalar_fmod2_op<T>> {
-  enum {
-    Cost = 13,  // Reciprocal throughput of FPREM on Haswell.
-    PacketAccess = false,
-  };
-};
 
 template <typename T>
 struct scalar_asinh_op {
@@ -127,6 +92,35 @@ struct scalar_binary_pow_op_google {
 
 template <typename Scalar, typename Exponent>
 struct functor_traits<scalar_binary_pow_op_google<Scalar, Exponent>> {
+  enum { Cost = 5 * NumTraits<Scalar>::MulCost, PacketAccess = false };
+};
+
+template <typename Scalar, typename Exponent>
+struct safe_scalar_binary_pow_op {
+  static_assert(std::is_integral<Scalar>::value, "Integer type expected");
+  static_assert(std::is_integral<Exponent>::value &&
+                    std::is_signed<Exponent>::value,
+                "Signed integer type expected");
+
+  bool* const error;
+
+  EIGEN_DEVICE_FUNC EIGEN_STRONG_INLINE safe_scalar_binary_pow_op(bool* error)
+      : error(error) {}
+
+  EIGEN_DEVICE_FUNC inline Scalar operator()(const Scalar& a,
+                                             const Exponent& b) const {
+    const Exponent safe_b = tensorflow::internal::SubtleMustCopy(b);
+    if (TF_PREDICT_TRUE(safe_b >= 0)) {
+      return numext::pow(a, safe_b);
+    } else {
+      *error = true;
+      return 0;
+    }
+  }
+};
+
+template <typename Scalar, typename Exponent>
+struct functor_traits<safe_scalar_binary_pow_op<Scalar, Exponent>> {
   enum { Cost = 5 * NumTraits<Scalar>::MulCost, PacketAccess = false };
 };
 
@@ -622,6 +616,12 @@ struct acos : base<T, Eigen::internal::scalar_acos_op<T>> {};
 template <typename T>
 struct atan : base<T, Eigen::internal::scalar_atan_op<T>> {};
 
+template <typename T>
+struct bessel_i0e : base<T, Eigen::internal::scalar_i0e_op<T>> {};
+
+template <typename T>
+struct bessel_i1e : base<T, Eigen::internal::scalar_i1e_op<T>> {};
+
 struct logical_not : base<bool, Eigen::internal::scalar_boolean_not_op<bool>> {
 };
 
@@ -721,7 +721,7 @@ struct safe_div : base<T, Eigen::internal::safe_div_or_mod_op<
 };
 
 template <typename T>
-struct fmod : base<T, Eigen::internal::scalar_fmod2_op<T>> {};
+struct fmod : base<T, Eigen::internal::scalar_fmod_op<T>> {};
 
 template <typename T>
 struct mod : base<T, Eigen::internal::scalar_mod2_op<T>> {};
@@ -757,6 +757,11 @@ template <typename T>
 struct pow : base<T, Eigen::internal::scalar_binary_pow_op_google<T, T>> {};
 
 template <typename T>
+struct safe_pow : base<T, Eigen::internal::safe_scalar_binary_pow_op<T, T>> {
+  static const bool has_errors = true;
+};
+
+template <typename T>
 struct maximum : base<T, Eigen::internal::scalar_max_op<T>> {};
 
 template <typename T>
@@ -764,6 +769,10 @@ struct minimum : base<T, Eigen::internal::scalar_min_op<T>> {};
 
 template <typename T>
 struct igamma : base<T, Eigen::internal::scalar_igamma_op<T>> {};
+
+template <typename T>
+struct random_gamma_grad
+    : base<T, Eigen::internal::scalar_gamma_sample_der_alpha_op<T>> {};
 
 template <typename T>
 struct igammac : base<T, Eigen::internal::scalar_igammac_op<T>> {};

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "tensorflow/core/platform/logging.h"
 // IWYU pragma: no_include "llvm/IR/Intrinsics.gen.inc"
@@ -27,6 +28,8 @@ limitations under the License.
 #include "tensorflow/compiler/xla/primitive_util.h"
 #include "tensorflow/compiler/xla/service/elemental_ir_emitter.h"
 #include "tensorflow/compiler/xla/service/gpu/elemental_ir_emitter.h"
+#include "tensorflow/compiler/xla/service/gpu/ir_emitter_nested.h"
+#include "tensorflow/compiler/xla/service/gpu/ir_emitter_unnested.h"
 #include "tensorflow/compiler/xla/service/gpu/partition_assignment.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
 #include "tensorflow/compiler/xla/service/llvm_ir/fused_ir_emitter.h"
@@ -188,6 +191,8 @@ bool IrEmitter::MaybeEmitDirectAtomicOperation(
   HloOpcode root_opcode = computation.root_instruction()->opcode();
   PrimitiveType element_type =
       computation.root_instruction()->shape().element_type();
+  bool is_atomic_integral = element_type == S32 || element_type == U32 ||
+                            element_type == S64 || element_type == U64;
   llvm::Value* source = ir_builder_.CreateLoad(source_address, "source");
   if (root_opcode == HloOpcode::kAdd) {
     // NVPTX supports atomicAdd on F32 and integer types.
@@ -198,7 +203,7 @@ bool IrEmitter::MaybeEmitDirectAtomicOperation(
                                    {output_address->getType()}, &ir_builder_);
       return true;
     }
-    if (primitive_util::IsIntegralType(element_type)) {
+    if (is_atomic_integral) {
       // integral + integral
       ir_builder_.CreateAtomicRMW(llvm::AtomicRMWInst::Add, output_address,
                                   source,
@@ -207,9 +212,8 @@ bool IrEmitter::MaybeEmitDirectAtomicOperation(
     }
   }
 
-  // NVPTX supports atomicMax and atomicMin on only integer types.
-  if (root_opcode == HloOpcode::kMaximum &&
-      primitive_util::IsIntegralType(element_type)) {
+  // NVPTX supports atomicMax and atomicMin only on integer types.
+  if (root_opcode == HloOpcode::kMaximum && is_atomic_integral) {
     // max(integral, integral)
     auto opcode = primitive_util::IsSignedIntegralType(element_type)
                       ? llvm::AtomicRMWInst::Max
@@ -219,8 +223,7 @@ bool IrEmitter::MaybeEmitDirectAtomicOperation(
     return true;
   }
 
-  if (root_opcode == HloOpcode::kMinimum &&
-      primitive_util::IsIntegralType(element_type)) {
+  if (root_opcode == HloOpcode::kMinimum && is_atomic_integral) {
     // min(integral, integral)
     auto opcode = primitive_util::IsSignedIntegralType(element_type)
                       ? llvm::AtomicRMWInst::Min
@@ -269,7 +272,7 @@ bool IrEmitter::MaybeEmitDirectAtomicOperation(
 //   cas_new_output_address = alloca(atomic_size);
 //   cas_old_output_address = alloca(atomic_size);
 //   if (atomic_size != element_size) {
-//     atomic_address = output_address & ((int64)(-2));
+//     atomic_address = output_address & ((int64)(-4));
 //     new_output_address = cas_new_output_address + (output_address & 3);
 //   } else {
 //     atomic_address = output_address;
@@ -326,7 +329,7 @@ Status IrEmitter::EmitAtomicOperationUsingCAS(const HloComputation& computation,
         ir_builder_.CreatePtrToInt(output_address, address_int_type);
     llvm::Value* mask = llvm::ConstantInt::get(address_int_type, 3);
     llvm::Value* offset = ir_builder_.CreateAnd(atomic_memory_address, mask);
-    mask = llvm::ConstantInt::get(address_int_type, -2);
+    mask = llvm::ConstantInt::get(address_int_type, -4);
     atomic_memory_address = ir_builder_.CreateAnd(atomic_memory_address, mask);
     atomic_memory_address =
         ir_builder_.CreateIntToPtr(atomic_memory_address, atomic_address_type);
@@ -418,23 +421,52 @@ Status IrEmitter::EmitAtomicOperationForNestedComputation(
 
 Status IrEmitter::HandleSelect(HloInstruction* select) {
   auto pred = select->operand(0);
-  auto on_true = select->operand(1);
-  auto on_false = select->operand(2);
   TF_RET_CHECK(pred->shape().element_type() == PRED);
-
-  if (ShapeUtil::IsTuple(select->shape())) {
-    llvm_ir::EmitTupleSelect(GetIrArray(*select, *select),
-                             GetIrArray(*pred, *select),
-                             GetBasePointer(*on_true),
-                             GetBasePointer(*on_false), &ir_builder_, module_);
-    return Status::OK();
-  }
-
   // We must not call the subclass `DefaultAction` method, lest its
   // `HandleSelect` call `IrEmitter::HandleSelect` and its `DefaultAction`
   // assume no handler has already been called.
   return IrEmitter::DefaultAction(select);
 }
+
+Status IrEmitter::HandleTupleSelect(HloInstruction* tuple_select) {
+  auto pred = tuple_select->operand(0);
+  auto on_true = tuple_select->operand(1);
+  auto on_false = tuple_select->operand(2);
+  TF_RET_CHECK(pred->shape().element_type() == PRED);
+  TF_RET_CHECK(ShapeUtil::IsScalar(pred->shape()));
+  TF_RET_CHECK(ShapeUtil::IsTuple(tuple_select->shape()));
+  llvm_ir::EmitTupleSelect(GetIrArray(*tuple_select, *tuple_select),
+                           GetIrArray(*pred, *tuple_select),
+                           GetBasePointer(*on_true), GetBasePointer(*on_false),
+                           &ir_builder_, module_);
+  return Status::OK();
+}
+
+namespace {
+llvm::Value* Real(llvm::Value* x, llvm::IRBuilder<>* ir_builder) {
+  return ir_builder->CreateExtractValue(x, {0});
+}
+
+llvm::Value* Imag(llvm::Value* x, llvm::IRBuilder<>* ir_builder) {
+  return ir_builder->CreateExtractValue(x, {1});
+}
+
+std::pair<llvm::Value*, llvm::Value*> MultiplyComplex(
+    llvm::Value* lhs_value, llvm::Value* rhs_value,
+    llvm::IRBuilder<>* ir_builder) {
+  llvm::Value* lhs_real = Real(lhs_value, ir_builder);
+  llvm::Value* lhs_imag = Imag(lhs_value, ir_builder);
+  llvm::Value* rhs_real = Real(rhs_value, ir_builder);
+  llvm::Value* rhs_imag = Imag(rhs_value, ir_builder);
+  llvm::Value* real_result1 = ir_builder->CreateFMul(lhs_real, rhs_real);
+  llvm::Value* real_result2 = ir_builder->CreateFMul(lhs_imag, rhs_imag);
+  llvm::Value* real_result = ir_builder->CreateFSub(real_result1, real_result2);
+  llvm::Value* imag_result1 = ir_builder->CreateFMul(lhs_real, rhs_imag);
+  llvm::Value* imag_result2 = ir_builder->CreateFMul(lhs_imag, rhs_real);
+  llvm::Value* imag_result = ir_builder->CreateFAdd(imag_result1, imag_result2);
+  return {real_result, imag_result};
+}
+}  // namespace
 
 Status IrEmitter::HandleDot(HloInstruction* dot) {
   auto lhs_instruction = dot->operand(0);
@@ -446,33 +478,26 @@ Status IrEmitter::HandleDot(HloInstruction* dot) {
   const Shape& lhs_shape = lhs_instruction->shape();
   const Shape& rhs_shape = rhs_instruction->shape();
 
+  // TODO(b/110211620): Convert to use i32 index_type when it is possible.
+  llvm::Type* index_type = ir_builder_.getInt64Ty();
+  llvm_ir::IrArray::Index element_index(index_type);
   if (ShapeUtil::IsScalar(lhs_shape) && ShapeUtil::IsScalar(rhs_shape)) {
     // If the operands are scalar, don't emit any loops.
     llvm::Value* lhs_value =
-        lhs_array.EmitReadArrayElement(/*index=*/{}, &ir_builder_);
+        lhs_array.EmitReadArrayElement(/*index=*/element_index, &ir_builder_);
     llvm::Value* rhs_value =
-        rhs_array.EmitReadArrayElement(/*index=*/{}, &ir_builder_);
+        rhs_array.EmitReadArrayElement(/*index=*/element_index, &ir_builder_);
     llvm::Value* result;
     if (ShapeUtil::ElementIsComplex(lhs_shape)) {
-      auto real = [&](llvm::Value* x) {
-        return ir_builder_.CreateExtractValue(x, {0});
-      };
-      auto imag = [&](llvm::Value* x) {
-        return ir_builder_.CreateExtractValue(x, {1});
-      };
-      llvm::Value* real_result = ir_builder_.CreateFSub(
-          ir_builder_.CreateFMul(real(lhs_value), real(rhs_value)),
-          ir_builder_.CreateFMul(imag(lhs_value), imag(rhs_value)));
-      llvm::Value* imag_result = ir_builder_.CreateFAdd(
-          ir_builder_.CreateFMul(real(lhs_value), imag(rhs_value)),
-          ir_builder_.CreateFMul(imag(lhs_value), real(rhs_value)));
+      auto value = MultiplyComplex(lhs_value, rhs_value, &ir_builder_);
       result = llvm::ConstantAggregateZero::get(lhs_array.GetElementLlvmType());
-      result = ir_builder_.CreateInsertValue(result, real_result, {0});
-      result = ir_builder_.CreateInsertValue(result, imag_result, {1});
+      result = ir_builder_.CreateInsertValue(result, value.first, {0});
+      result = ir_builder_.CreateInsertValue(result, value.second, {1});
     } else {
       result = ir_builder_.CreateFMul(lhs_value, rhs_value);
     }
-    target_array.EmitWriteArrayElement(/*index=*/{}, result, &ir_builder_);
+    target_array.EmitWriteArrayElement(/*index=*/element_index, result,
+                                       &ir_builder_);
     return Status::OK();
   }
 
@@ -546,20 +571,13 @@ Status IrEmitter::HandleDot(HloInstruction* dot) {
   llvm::Value* accum = ir_builder_.CreateLoad(accum_address);
   llvm::Value* updated_accum;
   if (ShapeUtil::ElementIsComplex(lhs_shape)) {
-#define REAL(x) ir_builder_.CreateExtractValue(x, {0})
-#define IMAG(x) ir_builder_.CreateExtractValue(x, {1})
-    llvm::Value* product_real = ir_builder_.CreateFSub(
-        ir_builder_.CreateFMul(REAL(lhs_element), REAL(rhs_element)),
-        ir_builder_.CreateFMul(IMAG(lhs_element), IMAG(rhs_element)));
-    llvm::Value* product_imag = ir_builder_.CreateFAdd(
-        ir_builder_.CreateFMul(REAL(lhs_element), IMAG(rhs_element)),
-        ir_builder_.CreateFMul(IMAG(lhs_element), REAL(rhs_element)));
-    updated_accum = ir_builder_.CreateInsertValue(
-        accum, ir_builder_.CreateFAdd(REAL(accum), product_real), {0});
-    updated_accum = ir_builder_.CreateInsertValue(
-        updated_accum, ir_builder_.CreateFAdd(IMAG(accum), product_imag), {1});
-#undef IMAG
-#undef REAL
+    auto value = MultiplyComplex(lhs_element, rhs_element, &ir_builder_);
+    llvm::Value* accum_real = Real(accum, &ir_builder_);
+    llvm::Value* real_sum = ir_builder_.CreateFAdd(accum_real, value.first);
+    updated_accum = ir_builder_.CreateInsertValue(accum, real_sum, {0});
+    llvm::Value* accum_imag = Imag(accum, &ir_builder_);
+    llvm::Value* imag_sum = ir_builder_.CreateFAdd(accum_imag, value.second);
+    updated_accum = ir_builder_.CreateInsertValue(updated_accum, imag_sum, {1});
   } else {
     llvm::Value* product = ir_builder_.CreateFMul(lhs_element, rhs_element);
     updated_accum = ir_builder_.CreateFAdd(accum, product);
@@ -570,7 +588,7 @@ Status IrEmitter::HandleDot(HloInstruction* dot) {
   // address. The index into the target address is the concatenation of the rhs
   // and lhs indexes with the reduction dimensions removed. The terms from the
   // rhs index are the lower dimensions in the index so we add them first.
-  llvm_ir::IrArray::Index target_index;
+  llvm_ir::IrArray::Index target_index(index_type);
   for (size_t dimension = 0; dimension < lhs_index.size(); ++dimension) {
     if (dimension != lhs_reduction_dimension) {
       target_index.push_back(lhs_index[dimension]);
@@ -596,7 +614,7 @@ Status IrEmitter::HandleDot(HloInstruction* dot) {
 }
 
 Status IrEmitter::HandleConvolution(HloInstruction* convolution) {
-  if (ShapeUtil::HasZeroElements(convolution->shape())) {
+  if (ShapeUtil::IsZeroElementArray(convolution->shape())) {
     // Emit no code for an empty output.
     return Status::OK();
   }
@@ -605,10 +623,17 @@ Status IrEmitter::HandleConvolution(HloInstruction* convolution) {
       "Hit a case for convolution that is not implemented on GPU.");
 }
 
+Status IrEmitter::HandleFft(HloInstruction* fft) {
+  if (ShapeUtil::IsZeroElementArray(fft->shape())) {
+    // Emit no code for an empty output.
+    return Status::OK();
+  }
+  return Unimplemented("Hit a case for fft that is not implemented on GPU.");
+}
+
 Status IrEmitter::HandleCrossReplicaSum(HloInstruction* crs) {
   // TODO(b/33011107): Support cross replica sum on GPU.
-  return Unimplemented(
-      "Cross replica sum not implemented on GPU. See b/33011107.");
+  return Unimplemented("CrossReplicaSum is not implemented on GPU.");
 }
 
 Status IrEmitter::HandleParameter(HloInstruction* parameter) {
@@ -702,11 +727,13 @@ Status IrEmitter::HandleCustomCall(HloInstruction*) {
 }
 
 Status IrEmitter::HandleInfeed(HloInstruction*) {
-  return Unimplemented("Infeed is not supported on GPU (b/30467474).");
+  // TODO(b/30467474): Implement infeed on GPU.
+  return Unimplemented("Infeed is not supported on GPU.");
 }
 
 Status IrEmitter::HandleOutfeed(HloInstruction*) {
-  return Unimplemented("Outfeed is not supported on GPU (b/34359662).");
+  // TODO(b/34359662): Implement outfeed on GPU.
+  return Unimplemented("Outfeed is not supported on GPU.");
 }
 
 Status IrEmitter::HandleRng(HloInstruction* random) {
@@ -727,35 +754,27 @@ Status IrEmitter::HandleRng(HloInstruction* random) {
       .EmitLoop(IrName(random));
 }
 
-Status IrEmitter::HandleConditional(HloInstruction* conditional) {
-  auto pred = conditional->operand(0);
-  auto true_arg = conditional->operand(1);
-  auto false_arg = conditional->operand(2);
+Status IrEmitter::HandleBatchNormInference(HloInstruction*) {
+  return Unimplemented(
+      "The GPU backend does not implement BatchNormInference directly.  It "
+      "should be lowered before IR emission to HLO-soup using "
+      "BatchNormRewriter or to a cudnn CustomCall using "
+      "CudnnBatchNormRewriter.");
+}
 
-  llvm::Value* conditional_result = GetBasePointer(*conditional);
+Status IrEmitter::HandleBatchNormTraining(HloInstruction*) {
+  return Unimplemented(
+      "The GPU backend does not implement BatchNormTraining directly.  It "
+      "should be lowered before IR emission to HLO-soup using "
+      "BatchNormRewriter or to a cudnn CustomCall using "
+      "CudnnBatchNormRewriter.");
+}
 
-  llvm::LoadInst* pred_value = ir_builder_.CreateLoad(
-      GetBasePointer(*pred),
-      llvm_ir::AsStringRef(IrName(conditional, "load_predicate_value")));
-  llvm::Value* pred_cond = ir_builder_.CreateICmpNE(
-      pred_value,
-      llvm::ConstantInt::get(llvm_ir::PrimitiveTypeToIrType(PRED, module_), 0),
-      llvm_ir::AsStringRef(IrName(conditional, "boolean_predicate")));
-  llvm_ir::LlvmIfData if_data = llvm_ir::EmitIfThenElse(
-      pred_cond, IrName(conditional, "if_then_else"), &ir_builder_);
-
-  SetToFirstInsertPoint(if_data.true_block, &ir_builder_);
-  TF_RETURN_IF_ERROR(EmitCallToNestedComputation(
-      *conditional->true_computation(), {GetBasePointer(*true_arg)},
-      conditional_result));
-
-  SetToFirstInsertPoint(if_data.false_block, &ir_builder_);
-  TF_RETURN_IF_ERROR(EmitCallToNestedComputation(
-      *conditional->false_computation(), {GetBasePointer(*false_arg)},
-      conditional_result));
-
-  SetToFirstInsertPoint(if_data.after_block, &ir_builder_);
-  return Status::OK();
+Status IrEmitter::HandleBatchNormGrad(HloInstruction*) {
+  return Unimplemented(
+      "The GPU backend does not implement BatchNormGrad directly.  It should "
+      "be lowered before IR emission to HLO-soup (using BatchNormRewriter) or "
+      "to a cudnn CustomCall using CudnnBatchNormRewriter.");
 }
 
 llvm_ir::IrArray::Index IrEmitter::EmitOperandArrayLoopNest(
@@ -766,8 +785,8 @@ llvm_ir::IrArray::Index IrEmitter::EmitOperandArrayLoopNest(
   // reduction dimension.
   std::vector<int64> dimensions;
   const Shape& shape = operand_array.GetShape();
-  for (int i = shape.layout().minor_to_major_size() - 1; i >= 0; --i) {
-    int64 dimension = shape.layout().minor_to_major(i);
+  for (int i = 0; i < LayoutUtil::MinorToMajor(shape).size(); ++i) {
+    int64 dimension = LayoutUtil::Major(shape.layout(), i);
     if (dimension != reduction_dimension) {
       dimensions.push_back(dimension);
     }

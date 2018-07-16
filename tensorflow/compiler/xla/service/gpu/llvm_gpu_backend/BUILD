@@ -34,6 +34,7 @@ cc_library(
         "//tensorflow/compiler/xla/service/llvm_ir:llvm_util",
         "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
+        "@llvm//:amdgpu_code_gen",
         "@llvm//:analysis",
         "@llvm//:bit_reader",
         "@llvm//:bit_writer",
@@ -47,7 +48,6 @@ cc_library(
         "@llvm//:scalar",
         "@llvm//:support",
         "@llvm//:target",
-        "@llvm//:transform_utils",
     ],
 )
 
@@ -67,18 +67,4 @@ tf_cc_test(
         "@llvm//:core",
         "@llvm//:support",
     ],
-)
-
-# -----------------------------------------------------------------------------
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
 )

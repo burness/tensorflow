@@ -15,7 +15,7 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/service/hlo_tfgraph_builder.h"
 #include "tensorflow/compiler/xla/layout_util.h"
-#include "tensorflow/compiler/xla/literal_util.h"
+#include "tensorflow/compiler/xla/literal.h"
 #include "tensorflow/compiler/xla/service/hlo_opcode.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
@@ -166,7 +166,7 @@ void HloTfGraphBuilder::SetNodeAttrs(const HloInstruction* instruction,
       layout_string = ShapeUtil::HumanStringWithLayout(instruction->shape());
     } else {
       layout_string = StrCat(
-          "{", Join(instruction->shape().layout().minor_to_major(), ","), "}");
+          "{", Join(LayoutUtil::MinorToMajor(instruction->shape()), ","), "}");
     }
     attrs["layout"].set_s(layout_string);
   }

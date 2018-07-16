@@ -21,8 +21,10 @@ import gzip
 import os
 import zlib
 
+from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.data.ops import iterator_ops
 from tensorflow.python.data.ops import readers
+from tensorflow.python.eager import context
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import errors
@@ -35,6 +37,13 @@ from tensorflow.python.ops import io_ops
 from tensorflow.python.ops import parsing_ops
 from tensorflow.python.platform import test
 from tensorflow.python.util import compat
+
+
+try:
+  import psutil  # pylint: disable=g-import-not-at-top
+  psutil_import_succeeded = True
+except ImportError:
+  psutil_import_succeeded = False
 
 
 class TextLineDatasetTest(test.TestCase):
@@ -161,6 +170,34 @@ class TextLineDatasetTest(test.TestCase):
       with self.assertRaises(errors.OutOfRangeError):
         sess.run(iterator.get_next())
 
+  def testIteratorResourceCleanup(self):
+    filename = os.path.join(self.get_temp_dir(), "text.txt")
+    with open(filename, "wt") as f:
+      for i in range(3):
+        f.write("%d\n" % (i,))
+    with context.eager_mode():
+      first_iterator = iter(readers.TextLineDataset(filename))
+      self.assertEqual(b"0", next(first_iterator).numpy())
+      second_iterator = iter(readers.TextLineDataset(filename))
+      self.assertEqual(b"0", next(second_iterator).numpy())
+      # Eager kernel caching is based on op attributes, which includes the
+      # Dataset's output shape. Create a different kernel to test that they
+      # don't create resources with the same names.
+      different_kernel_iterator = iter(
+          readers.TextLineDataset(filename).repeat().batch(16))
+      self.assertEqual([16], next(different_kernel_iterator).shape)
+      # Remove our references to the Python Iterator objects, which (assuming no
+      # reference cycles) is enough to trigger DestroyResourceOp and close the
+      # partially-read files.
+      del first_iterator
+      del second_iterator
+      del different_kernel_iterator
+      if not psutil_import_succeeded:
+        self.skipTest(
+            "psutil is required to check that we've closed our files.")
+      open_files = psutil.Process().open_files()
+      self.assertNotIn(filename, [open_file.path for open_file in open_files])
+
 
 class FixedLengthRecordReaderTest(test.TestCase):
 
@@ -270,6 +307,24 @@ class FixedLengthRecordReaderTest(test.TestCase):
         for i in range(self._num_records):
           self.assertEqual(self._record(j, i), sess.run(iterator.get_next()))
       with self.assertRaises(errors.OutOfRangeError):
+        sess.run(iterator.get_next())
+
+  def testFixedLengthRecordDatasetWrongSize(self):
+    test_filenames = self._createFiles()
+    dataset = readers.FixedLengthRecordDataset(
+        test_filenames,
+        self._record_bytes + 1,  # Incorrect record length.
+        self._header_bytes,
+        self._footer_bytes,
+        buffer_size=10)
+    iterator = dataset.make_one_shot_iterator()
+
+    with self.test_session() as sess:
+      with self.assertRaisesRegexp(
+          errors.InvalidArgumentError,
+          r"Excluding the header \(5 bytes\) and footer \(2 bytes\), input "
+          r"file \".*fixed_length_record.0.txt\" has body length 21 bytes, "
+          r"which is not an exact multiple of the record length \(4 bytes\)."):
         sess.run(iterator.get_next())
 
   def _iterator_checkpoint_path(self):
@@ -718,12 +773,43 @@ class TFRecordDatasetTest(test.TestCase):
     one_mebibyte = 2**20
     d = readers.TFRecordDataset(self.test_filenames, buffer_size=one_mebibyte)
     iterator = d.make_one_shot_iterator()
+    next_element = iterator.get_next()
     with self.test_session() as sess:
       for j in range(self._num_files):
         for i in range(self._num_records):
-          self.assertAllEqual(self._record(j, i), sess.run(iterator.get_next()))
+          self.assertAllEqual(self._record(j, i), sess.run(next_element))
       with self.assertRaises(errors.OutOfRangeError):
-        sess.run(iterator.get_next())
+        sess.run(next_element)
+
+  def testReadFromDatasetOfFiles(self):
+    files = dataset_ops.Dataset.from_tensor_slices(self.test_filenames)
+    d = readers.TFRecordDataset(files)
+    iterator = d.make_one_shot_iterator()
+    next_element = iterator.get_next()
+    with self.test_session() as sess:
+      for j in range(self._num_files):
+        for i in range(self._num_records):
+          self.assertAllEqual(self._record(j, i), sess.run(next_element))
+      with self.assertRaises(errors.OutOfRangeError):
+        sess.run(next_element)
+
+  def testReadTenEpochsFromDatasetOfFilesInParallel(self):
+    files = dataset_ops.Dataset.from_tensor_slices(
+        self.test_filenames).repeat(10)
+    d = readers.TFRecordDataset(files, num_parallel_reads=4)
+    iterator = d.make_one_shot_iterator()
+    next_element = iterator.get_next()
+    expected = []
+    actual = []
+    with self.test_session() as sess:
+      for _ in range(10):
+        for j in range(self._num_files):
+          for i in range(self._num_records):
+            expected.append(self._record(j, i))
+            actual.append(sess.run(next_element))
+      with self.assertRaises(errors.OutOfRangeError):
+        sess.run(next_element)
+      self.assertEqual(sorted(expected), sorted(actual))
 
 
 if __name__ == "__main__":

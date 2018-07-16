@@ -58,6 +58,15 @@ xla_proto_library(
     ],
 )
 
+xla_proto_library(
+    name = "host_compute_metadata_proto",
+    srcs = ["host_compute_metadata.proto"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tensorflow/core:protos_all_cc",
+    ],
+)
+
 cc_library(
     name = "tf2xla",
     srcs = ["tf2xla.cc"],
@@ -72,7 +81,7 @@ cc_library(
         "//tensorflow/compiler/tf2xla/kernels:xla_cpu_only_ops",
         "//tensorflow/compiler/tf2xla/kernels:xla_ops",
         "//tensorflow/compiler/xla/client",
-        "//tensorflow/compiler/xla/client:computation",
+        "//tensorflow/compiler/xla/client/xla_client:xla_computation",
         "//tensorflow/core:core_cpu",
         "//tensorflow/core:core_cpu_internal",
         "//tensorflow/core:framework",
@@ -120,47 +129,59 @@ cc_library(
 cc_library(
     name = "xla_compiler",
     srcs = [
+        "const_analysis.cc",
+        "graph_compiler.cc",
         "xla_compilation_device.cc",
         "xla_compiler.cc",
         "xla_context.cc",
         "xla_helpers.cc",
         "xla_op_kernel.cc",
         "xla_op_registry.cc",
-        "graph_compiler.cc",
+        "xla_resource.cc",
         "xla_cpu_backend.cc",
+        "legacy_flags/backend_registration_flags.cc",
     ] + if_cuda_is_configured([
         "xla_gpu_backend.cc",
     ]),
     hdrs = [
+        "const_analysis.h",
         "graph_compiler.h",
+        "legacy_flags/backend_registration_flags.h",
         "xla_compilation_device.h",
         "xla_compiler.h",
         "xla_context.h",
         "xla_helpers.h",
         "xla_op_kernel.h",
         "xla_op_registry.h",
+        "xla_resource.h",
     ],
     visibility = [":friends"],
     deps = [
         ":common",
-        ":const_analysis",
         ":dump_graph",
         ":functionalize_control_flow",
+        ":host_compute_metadata_proto",
         ":sharding_util",
         ":tf2xla_util",
         "//tensorflow/compiler/tf2xla/lib:util",
-        "//tensorflow/compiler/xla:literal_util",
+        "//tensorflow/compiler/xla:literal",
         "//tensorflow/compiler/xla:shape_util",
+        "//tensorflow/compiler/xla:status_macros",
         "//tensorflow/compiler/xla:statusor",
         "//tensorflow/compiler/xla:types",
         "//tensorflow/compiler/xla:xla_data_proto",
         "//tensorflow/compiler/xla/client:client_library",
-        "//tensorflow/compiler/xla/client:computation",
-        "//tensorflow/compiler/xla/client:computation_builder",
         "//tensorflow/compiler/xla/client:local_client",
+        "//tensorflow/compiler/xla/client/lib:arithmetic",
+        "//tensorflow/compiler/xla/client/lib:constants",
+        "//tensorflow/compiler/xla/client/lib:numeric",
+        "//tensorflow/compiler/xla/client/xla_client:xla_builder",
+        "//tensorflow/compiler/xla/client/xla_client:xla_computation",
+        "//tensorflow/compiler/xla/legacy_flags:parse_flags_from_env",
         "//tensorflow/core:core_cpu",
         "//tensorflow/core:core_cpu_internal",
         "//tensorflow/core:framework",
+        "//tensorflow/core:framework_internal",
         "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
         "//tensorflow/core:protos_all_cc",
@@ -185,7 +206,7 @@ cc_library(
     ],
     visibility = [":friends"],
     deps = [
-        "//tensorflow/compiler/xla:literal_util",
+        "//tensorflow/compiler/xla:literal",
         "//tensorflow/compiler/xla:shape_util",
         "//tensorflow/compiler/xla:xla_data_proto",
         "//tensorflow/core:core_cpu_internal",
@@ -202,7 +223,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//tensorflow/compiler/xla:status_macros",
-        "//tensorflow/compiler/xla/client:computation_builder",
+        "//tensorflow/compiler/xla/client:sharding_builder",
         "//tensorflow/core:core_cpu",
         "//tensorflow/core:core_cpu_internal",
         "//tensorflow/core:framework",
@@ -268,6 +289,7 @@ tf_cc_test(
     deps = [
         ":tf2xla",
         ":tf2xla_proto",
+        "//tensorflow/compiler/xla:literal",
         "//tensorflow/compiler/xla:literal_util",
         "//tensorflow/compiler/xla:statusor",
         "//tensorflow/compiler/xla/client:client_library",
@@ -308,15 +330,18 @@ tf_cc_test(
         "//tensorflow/cc:cc_ops",
         "//tensorflow/cc:function_ops",
         "//tensorflow/cc:ops",
+        "//tensorflow/cc:resource_variable_ops",
         "//tensorflow/compiler/tf2xla/kernels:xla_ops",
-        "//tensorflow/compiler/xla:literal_util",
+        "//tensorflow/compiler/xla:literal",
         "//tensorflow/compiler/xla:shape_util",
+        "//tensorflow/compiler/xla:status_macros",
         "//tensorflow/compiler/xla/client:client_library",
         "//tensorflow/compiler/xla/client:local_client",
         "//tensorflow/compiler/xla/service:cpu_plugin",
         "//tensorflow/compiler/xla/tests:literal_test_util",
         "//tensorflow/core:core_cpu_internal",
         "//tensorflow/core:framework",
+        "//tensorflow/core:lib",
         "//tensorflow/core:tensor_testutil",
         "//tensorflow/core:test",
         "//tensorflow/core:test_main",
@@ -344,6 +369,7 @@ tf_cc_test(
     ],
     deps = [
         ":common",
+        "//tensorflow/compiler/xla:literal",
         "//tensorflow/compiler/xla:literal_util",
         "//tensorflow/core:framework",
         "//tensorflow/core:test",
@@ -352,28 +378,16 @@ tf_cc_test(
     ],
 )
 
-cc_library(
-    name = "const_analysis",
-    srcs = ["const_analysis.cc"],
-    hdrs = ["const_analysis.h"],
-    deps = [
-        "//tensorflow/core:core_cpu",
-        "//tensorflow/core:core_cpu_internal",
-        "//tensorflow/core:framework",
-        "//tensorflow/core:lib",
-        "//tensorflow/core:lib_internal",
-    ],
-)
-
 tf_cc_test(
     name = "const_analysis_test",
     size = "small",
     srcs = ["const_analysis_test.cc"],
     deps = [
-        ":const_analysis",
+        ":xla_compiler",
         "//tensorflow/cc:cc_ops",
         "//tensorflow/cc:function_ops",
         "//tensorflow/cc:ops",
+        "//tensorflow/compiler/tf2xla/kernels:xla_ops",
         "//tensorflow/core:core_cpu_internal",
         "//tensorflow/core:ops",
         "//tensorflow/core:test",
@@ -408,10 +422,9 @@ cc_library(
     hdrs = ["functionalize_control_flow.h"],
     deps = [
         ":tf2xla_util",
-        "//tensorflow/compiler/jit:graph_to_functiondef",
         "//tensorflow/compiler/jit:union_find",
         "//tensorflow/compiler/tf2xla:dump_graph",
-        "//tensorflow/compiler/tf2xla/ops:functional_ops",
+        "//tensorflow/compiler/tf2xla/ops:xla_ops",
         "//tensorflow/compiler/xla:status_macros",
         "//tensorflow/compiler/xla:util",
         "//tensorflow/core:core_cpu",
@@ -433,7 +446,7 @@ tf_cc_test(
         "//tensorflow/cc:function_ops",
         "//tensorflow/cc:ops",
         "//tensorflow/cc:resource_variable_ops",
-        "//tensorflow/compiler/tf2xla/cc:functional_ops",
+        "//tensorflow/compiler/tf2xla/cc:xla_ops",
         "//tensorflow/compiler/xla:status_macros",
         "//tensorflow/core:core_cpu",
         "//tensorflow/core:core_cpu_internal",
@@ -460,16 +473,12 @@ cc_library(
     ],
 )
 
-# -----------------------------------------------------------------------------
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
+tf_cc_test(
+    name = "xla_op_registry_test",
+    srcs = ["xla_op_registry_test.cc"],
+    deps = [
+        ":xla_compiler",
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
+    ],
 )

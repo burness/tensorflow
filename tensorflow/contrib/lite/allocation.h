@@ -14,8 +14,8 @@ limitations under the License.
 ==============================================================================*/
 // Main abstraction controlling the tflite interpreter.
 // See context.h for the API for defining operations (TfLiteRegistration).
-#ifndef THIRD_PARTY_TENSORFLOW_CONTRIB_LITE_ALLOCATION_H_
-#define THIRD_PARTY_TENSORFLOW_CONTRIB_LITE_ALLOCATION_H_
+#ifndef TENSORFLOW_CONTRIB_LITE_ALLOCATION_H_
+#define TENSORFLOW_CONTRIB_LITE_ALLOCATION_H_
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +23,7 @@ limitations under the License.
 #include "tensorflow/contrib/lite/context.h"
 #include "tensorflow/contrib/lite/error_reporter.h"
 #include "tensorflow/contrib/lite/simple_memory_arena.h"
+#include "tensorflow/contrib/lite/string.h"
 
 namespace tflite {
 
@@ -91,4 +92,4 @@ class MemoryAllocation : public Allocation {
 
 }  // namespace tflite
 
-#endif  // THIRD_PARTY_TENSORFLOW_CONTRIB_LITE_ALLOCATION_H_
+#endif  // TENSORFLOW_CONTRIB_LITE_ALLOCATION_H_

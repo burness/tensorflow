@@ -1,0 +1,14 @@
+{
+  "configDefaults" : {
+    "optionSet" : {
+      "BazelBuildOptionsRelease" : {
+        "p" : "--config=opt"
+      }
+    }
+  },
+  "projectName" : "tensorflow",
+  "packages" : [
+    ""
+  ],
+  "workspaceRoot" : "../../../.."
+}

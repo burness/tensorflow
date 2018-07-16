@@ -1,0 +1,3 @@
+/Users/burness/git_repository/tensorflow/tensorflow/cmake-build-debug/CMakeFiles/edit_cache.dir
+/Users/burness/git_repository/tensorflow/tensorflow/cmake-build-debug/CMakeFiles/rebuild_cache.dir
+/Users/burness/git_repository/tensorflow/tensorflow/cmake-build-debug/CMakeFiles/tensorflow.dir
